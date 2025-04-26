@@ -1,0 +1,285 @@
+# this script is used to create a settings file for the icon window script
+# sprite maps go into Lich5/data/icons
+# can get prepared sprite maps from https://drive.google.com/drive/folders/1yoakKMzTLyVnDguuMpMD58U993sNieiV
+# icon_settings.yaml saves to Lich5/data/icons and is used for the
+
+require 'gtk3'
+require 'yaml'
+
+module IconViewer
+  ICON_FOLDER   ||= File.join(DATA_DIR, 'icons')
+  CONFIG_FILE   ||= File.join(DATA_DIR, 'icons/icon_settings.yaml')
+  ICON_WIDTH    ||= 64
+  ICON_HEIGHT   ||= 64
+  IMAGE_SIZE    ||= 2048
+  ICONS_PER_ROW ||= IMAGE_SIZE / ICON_WIDTH
+  TOTAL_ICONS   ||= 1024
+  TOTAL_ROWS    ||= TOTAL_ICONS / ICONS_PER_ROW
+  VARIANTS      ||= [
+    '', '_green', '_blue', '_red',
+    '_greyscale', '_greyscale_green',
+    '_greyscale_blue', '_greyscale_red'
+  ]
+
+  @@config = {}
+  @@sections = {}
+  @@state_widgets = {}
+  @@name_entry = nil
+  @@active_entry = nil
+  @@avail_entry = nil
+  @@command_entry = nil
+  @@group_command_entry = nil
+  @@row_spin = nil
+  @@image_combo = nil
+
+  def self.populate_fields_for(button_key)
+    d = @@config[button_key] || {}
+    @@image_combo.model.each { |m,p,i| @@image_combo.set_active_iter(i) if i[0] == d['image'] }
+    @@name_entry.text     = d['name']     || ''
+    @@active_entry.text   = d['active']   || ''
+    @@avail_entry.text    = d['available']|| ''
+    @@command_entry.text  = d['command']  || ''
+    @@group_command_entry.text = d['group_command']|| ''
+  
+    scfg = d['states'] || {}
+    @@sections.values.map(&:values).flatten.each do |k|
+      w = @@state_widgets[k.to_sym]
+      sd = scfg[k] || {}
+      w[:variant].set_active(VARIANTS.index(sd['variant']) || 0)
+      w[:icon].value      = sd['icon'] || 1
+      w[:tooltip].text    = sd['tooltip'] || ''
+      w[:command].text    = sd['command'] || ''
+      w[:group_command].text = sd['group_command'] || ''
+    end
+  
+    if (r = d['row'])
+      @@row_spin.value = r
+    end
+  end
+
+  def self._script
+    Gtk.queue do
+      @@config = File.exist?(CONFIG_FILE) ? YAML.load_file(CONFIG_FILE) : {}
+
+      window = Gtk::Window.new('Icon Configurator')
+      window.set_default_size(700, 900)
+      window.signal_connect('delete-event') { |w,_| w.hide; true }
+
+      outer = Gtk::Box.new(:vertical, 8)
+      outer.margin = 8
+      window.add(outer)
+
+      grid = Gtk::Grid.new
+      grid.row_spacing    = 6
+      grid.column_spacing = 6
+      outer.pack_start(grid, expand: true, fill: true, padding: 0)
+
+      lbl_slot = Gtk::Label.new('Slot Number:')
+      selector = Gtk::ComboBoxText.new
+      (1..30).each { |i| selector.append_text("button#{i}") }
+      selector.active = 0
+      selector.hexpand = true
+      grid.attach(lbl_slot, 0, 0, 1, 1)
+      grid.attach(selector, 1, 0, 4, 1)
+
+      lbl_name = Gtk::Label.new('Name:')
+      @@name_entry = Gtk::Entry.new
+      @@name_entry.hexpand = true
+      grid.attach(lbl_name,    0, 1, 1, 1)
+      grid.attach(@@name_entry,  1, 1, 4, 1)
+
+      lbl_img = Gtk::Label.new('Image:')
+      @@image_combo = Gtk::ComboBoxText.new
+      @@image_combo.hexpand = true
+      Dir.glob(File.join(ICON_FOLDER,'*.bmp')).sort.each do |f|
+        next if f =~ /_(greyscale|green|blue|red)\.bmp$/
+        @@image_combo.append_text(File.basename(f,'.bmp'))
+      end
+      if (li = @@config.dig(selector.active_text, 'image') || @@config['last_image'])
+        @@image_combo.model.each { |m,p,i| @@image_combo.set_active_iter(i) if i[0]==li }
+      else
+        @@image_combo.active = 0
+      end
+      grid.attach(lbl_img,       0, 2, 1, 1)
+      grid.attach(@@image_combo,   1, 2, 4, 1)
+
+      lbl_active = Gtk::Label.new('Active:')
+      @@active_entry = Gtk::Entry.new
+      @@active_entry.hexpand = true
+      grid.attach(lbl_active,    0, 3, 1, 1)
+      grid.attach(@@active_entry,  1, 3, 4, 1)
+
+      lbl_available = Gtk::Label.new('Available:')
+      @@avail_entry = Gtk::Entry.new
+      @@avail_entry.hexpand = true
+      grid.attach(lbl_available, 0, 4, 1, 1)
+      grid.attach(@@avail_entry,   1, 4, 4, 1)
+
+      lbl_command = Gtk::Label.new('Command:')
+      @@command_entry = Gtk::Entry.new
+      @@command_entry.hexpand = true
+      grid.attach(lbl_command, 0, 5, 1, 1)
+      grid.attach(@@command_entry, 1, 5, 4, 1)
+
+      lbl_group_command = Gtk::Label.new('Group Cmd:')
+      @@group_command_entry = Gtk::Entry.new
+      @@group_command_entry.hexpand = true
+      grid.attach(lbl_group_command, 0, 6, 1, 1)
+      grid.attach(@@group_command_entry, 1, 6, 4, 1)
+
+      notebook = Gtk::Notebook.new
+      outer.pack_start(notebook, expand: true, fill: true, padding: 0)
+
+      @@sections = {
+        'Inactive' => { 'Available' => 'inactive_ready', 'Not Available' => 'inactive_unready' },
+        'Active'   => { 'Available' => 'active_ready',   'Not Available' => 'active_unready' }
+      }
+
+      @@state_widgets = {}
+
+      state_grid = Gtk::Grid.new
+      state_grid.row_spacing    = 12
+      state_grid.column_spacing = 12
+
+      @@sections.each_with_index do |(act, groups), row|
+        groups.each_with_index do |(avail_label, key), col|
+          frame = Gtk::Frame.new("#{act} / #{avail_label}")
+          grid2 = Gtk::Grid.new
+          grid2.row_spacing    = 6
+          grid2.column_spacing = 6
+          frame.add(grid2)
+
+          lbl_v = Gtk::Label.new('Variant:')
+          combo_v = Gtk::ComboBoxText.new
+          VARIANTS.each { |v| combo_v.append_text(v) }
+          combo_v.active = 0
+          grid2.attach(lbl_v,      0, 0, 1, 1)
+          grid2.attach(combo_v,    1, 0, 3, 1)
+
+          lbl_i = Gtk::Label.new('Icon Number:')
+          spin = Gtk::SpinButton.new(1, TOTAL_ICONS, 1)
+          grid2.attach(lbl_i,      0, 1, 1, 1)
+          grid2.attach(spin,       1, 1, 3, 1)
+
+          lbl_t = Gtk::Label.new('Tooltip:')
+          entry_t = Gtk::Entry.new
+          grid2.attach(lbl_t,      0, 2, 1, 1)
+          grid2.attach(entry_t,    1, 2, 3, 1)
+
+          lbl_c = Gtk::Label.new('Command:')
+          entry_c = Gtk::Entry.new
+          grid2.attach(lbl_c,      0, 3, 1, 1)
+          grid2.attach(entry_c,    1, 3, 3, 1)
+
+          lbl_g = Gtk::Label.new('Group Command:')
+          entry_g = Gtk::Entry.new
+          grid2.attach(lbl_g,      0, 4, 1, 1)
+          grid2.attach(entry_g,    1, 4, 3, 1)
+
+          preview = Gtk::Image.new
+          proc_preview = ->(val) {
+            begin
+              base = @@image_combo.active_text; suf = combo_v.active_text
+              fn = File.join(ICON_FOLDER, "#{base}#{suf}.bmp")
+              idx = val-1; cx, ry = idx % ICONS_PER_ROW, idx / ICONS_PER_ROW
+              pix = GdkPixbuf::Pixbuf.new(file: fn)
+              preview.pixbuf = pix.subpixbuf(cx*ICON_WIDTH, ry*ICON_HEIGHT, ICON_WIDTH, ICON_HEIGHT)
+            rescue; end
+          }
+          spin.signal_connect('value-changed') { |w| proc_preview.call(w.value_as_int) }
+          grid2.attach(preview,    4, 0, 1, 5)
+
+          @@state_widgets[key.to_sym] = {
+            variant: combo_v, icon: spin, tooltip: entry_t,
+            command: entry_c, group_command: entry_g
+          }
+          state_grid.attach(frame, col*2, row, 2, 1)
+        end
+      end
+      notebook.append_page(state_grid, Gtk::Label.new('States'))
+
+      frame_b = Gtk::Frame.new
+      vb = Gtk::Box.new(:vertical, 6)
+      frame_b.add(vb)
+      ctrl = Gtk::Box.new(:horizontal, 6)
+      ctrl.pack_start(Gtk::Label.new('Sheet Row:'), expand: false, fill: false, padding: 0)
+      rs = @@config.dig(selector.active_text, 'row') || 1
+      @@row_spin = Gtk::SpinButton.new(1, TOTAL_ROWS, 1)
+      @@row_spin.value = rs
+      ctrl.pack_start(@@row_spin, expand: false, fill: false, padding: 0)
+      range_lbl = Gtk::Label.new("Icons #{(rs-1)*ICONS_PER_ROW+1}-#{(rs-1)*ICONS_PER_ROW+ICONS_PER_ROW}")
+      ctrl.pack_start(range_lbl, expand: true, fill: true, padding: 0)
+      vb.pack_start(ctrl, expand: false, fill: false, padding: 0)
+      sc = Gtk::ScrolledWindow.new
+      sc.set_policy(:automatic, :automatic)
+      grid_ic = Gtk::Grid.new; grid_ic.halign=:center; grid_ic.row_spacing=4; grid_ic.column_spacing=4
+      sc.add(grid_ic); vb.pack_start(sc, expand: true, fill: true, padding: 0)
+      render = proc do |ri|
+        grid_ic.each { |c| grid_ic.remove(c) }
+        base = @@image_combo.active_text
+        pix = GdkPixbuf::Pixbuf.new(file: File.join(ICON_FOLDER, "#{base}.bmp"))
+        (0...ICONS_PER_ROW).each do |ci|
+          idx = (ri-1)*ICONS_PER_ROW+ci; cx, ry = ci%8, ci/8
+          begin
+            sub = pix.subpixbuf(ci*ICON_WIDTH, (ri-1)*ICON_HEIGHT, ICON_WIDTH, ICON_HEIGHT)
+            eb = Gtk::EventBox.new.add(Gtk::Image.new(pixbuf: sub))
+            grid_ic.attach(eb, cx, ry, 1, 1)
+          rescue; end
+        end
+        grid_ic.show_all
+      end
+      @@row_spin.signal_connect('value-changed') do |w|
+        render.call(w.value_as_int)
+        s=(w.value_as_int-1)*ICONS_PER_ROW+1; range_lbl.text="Icons #{s}-#{s+ICONS_PER_ROW-1}"
+        cfg = @@config[selector.active_text] || {}
+        cfg['row'] = w.value_as_int; @@config[selector.active_text] = cfg
+        File.write(CONFIG_FILE, @@config.to_yaml)
+      end
+      @@image_combo.signal_connect('changed') do
+        render.call(@@row_spin.value_as_int)
+        cfg = @@config[selector.active_text] || {}
+        cfg['image'] = @@image_combo.active_text; @@config[selector.active_text] = cfg
+        File.write(CONFIG_FILE, @@config.to_yaml)
+      end
+      render.call(@@row_spin.value_as_int)
+      notebook.append_page(frame_b, Gtk::Label.new('Browse'))
+
+      save_btn = Gtk::Button.new(label:'Save Settings')
+      save_btn.signal_connect('clicked') do
+        key = selector.active_text; cfg = @@config[key] || {}
+        cfg['name']      = @@name_entry.text
+        cfg['active']    = @@active_entry.text
+        cfg['available'] = @@avail_entry.text
+        cfg['command'] = @@command_entry.text
+        cfg['group_command'] = @@group_command_entry.text
+        states_cfg = @@sections.values.map(&:values).flatten.map do |k|
+          w = @@state_widgets[k.to_sym]
+          [k, {
+            'variant'=>w[:variant].active_text,
+            'icon'=>w[:icon].value_as_int,
+            'tooltip'=>w[:tooltip].text,
+            'command'=>w[:command].text,
+            'group_command'=>w[:group_command].text
+          }]
+        end.to_h
+        cfg['states'] = states_cfg
+        @@config[key] = cfg
+        File.write(CONFIG_FILE, @@config.to_yaml)
+      end
+      outer.pack_start(save_btn, expand: false, fill: false, padding: 10)
+
+      selector.signal_connect('changed') do
+        populate_fields_for(selector.active_text)
+      end
+
+      window.show_all
+      GLib::Timeout.add(250) do
+        selector.set_active(0)
+        populate_fields_for(selector.active_text)  # manually call your population function
+        false
+      end
+    end
+  end
+end
+
+IconViewer._script
