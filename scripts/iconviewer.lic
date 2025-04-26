@@ -1,7 +1,25 @@
-# this script is used to create a settings file for the icon window script
-# sprite maps go into Lich5/data/icons
-# can get prepared sprite maps from https://drive.google.com/drive/folders/1yoakKMzTLyVnDguuMpMD58U993sNieiV
-# icon_settings.yaml saves to Lich5/data/icons and is used for the
+=begin
+ this script is used to create a settings file for the icon window script
+ sprite maps go into Lich5/data/icons
+ can get prepared sprite maps from https://drive.google.com/drive/folders/1yoakKMzTLyVnDguuMpMD58U993sNieiV
+ icon_settings.yaml saves to Lich5/data/icons and is used for the
+
+          author: elanthia-online
+    contributors: Nisugi
+            game: gemstone
+            tags: visual, icons, combat, ???
+         version: 0.1
+        required: Lich >= 5.6.2  maybe
+
+
+     Icons Packs: https://drive.google.com/drive/folders/1yoakKMzTLyVnDguuMpMD58U993sNieiV?usp=drive_link
+      Screenshot: https://drive.google.com/drive/folders/1W54WCHn7qsDDeyQTB09atayxLAPyINY9
+
+  Version Control:
+  v0.1
+  - alpha
+
+=end
 
 require 'gtk3'
 require 'yaml'
