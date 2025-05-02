@@ -837,8 +837,16 @@ module BarBar
     @@bar_windows
   end
 
-  # ─────────────────────────────────────────────
-  # 2) The BarWindow class _inside_ BarBar
+  def self.press(key)
+    cfg = config_for(key)
+    return unless cfg
+    state = determine_state(cfg)
+    cmd = cfg.dig('states', state.to_s, 'command')
+    return if cmd.to_s.strip.empty?
+    do_client(cmd)
+    puts(">#{cmd}")
+  end
+
   class BarWindow
     def initialize(bar_cfg)
       @cfg         = bar_cfg
