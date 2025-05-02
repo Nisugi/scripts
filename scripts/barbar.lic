@@ -1,0 +1,1109 @@
+=begin
+  ;barbar.lic   Graphical Action Bars
+
+  right click on window to configure
+  sprite maps goes into Lich5/data/icons
+  sprite maps should be 2048 x 2048 pixels 
+    with icons being 64 x 64 pixels, no padding between icons
+
+=end
+
+require 'gtk3'
+require 'yaml'
+
+class ConfigWindow < Gtk::Window
+  def initialize(config, parent_window = nil, selected_bar_id = nil)
+    @config = config
+    @parent_window = parent_window
+    @bar_tabs = {}
+    @controls = {}
+    
+    super()
+    set_title('BarBar Configurator')
+    set_default_size(600, 400)
+    set_keep_above(true)
+    if parent_window
+      set_transient_for(parent_window)
+      set_position(Gtk::WindowPosition::CENTER_ON_PARENT)
+    end
+
+    # Notebook to hold one tab per bar
+    notebook = Gtk::Notebook.new
+
+    @bar_tabs = {}  # bar_id => page widget
+
+    icon_page, icon_ctrlls = build_button_manager_tab
+    notebook.append_page(icon_page, Gtk::Label.new('Manage Buttons'))
+
+    browse_page = build_browse_icons_tab
+    notebook.append_page(browse_page, Gtk::Label.new('Browse Icons'))
+    @controls[:icon_manager] = icon_ctrlls
+
+    # For each bar in config, create a tab
+    @config['bars'].each do |bar_cfg|
+      page, ctrls = build_bar_tab(bar_cfg)
+      notebook.append_page(page, Gtk::Label.new(bar_cfg['name']))
+      @bar_tabs[bar_cfg['id']] = page
+      @controls[bar_cfg['id']] = ctrls
+    end
+
+    # “Add Bar” button below
+    add_bar_btn = Gtk::Button.new(label: 'Add Bar')
+    add_bar_btn.signal_connect('clicked') { add_new_bar_tab(notebook) }
+
+    save_all   = Gtk::Button.new(label: 'Save All')
+    cancel_btn = Gtk::Button.new(label: 'Cancel')
+
+    ctrl_box = Gtk::Box.new(:horizontal, 6)
+    ctrl_box.homogeneous = true
+    [add_bar_btn, save_all, cancel_btn].each do |btn|
+      ctrl_box.pack_start(btn, expand: true, fill: true, padding: 4)
+    end
+
+    # pack notebook + button in a VBox
+    vbox = Gtk::Box.new(:vertical, 6)
+    vbox.pack_start(notebook, expand: true, fill: true, padding: 0)
+    vbox.pack_start(add_bar_btn, expand: false, fill: false, padding: 4)
+    vbox.pack_end(ctrl_box, expand: false, fill: false, padding: 4)
+    self.child = vbox
+
+    # on save: pull all fields back into bar_cfg + write YAML + reload
+    save_all.signal_connect('clicked') do
+      @config['bars'].each do |bar_cfg|
+        ctrls = @controls[bar_cfg['id']]        
+        bar_cfg['name']      = ctrls[:name_entry].text
+        bar_cfg['enabled']   = ctrls[:enabled_cb].active?
+        bar_cfg['position']  = {'x'=> ctrls[:x_spin].value.to_i, 'y'=> ctrls[:y_spin].value.to_i}
+        bar_cfg['size']      = {
+          'cols'=> ctrls[:cols_spin].value.to_i,
+          'rows'=> ctrls[:rows_spin].value.to_i,
+          'icon_size'=> ctrls[:isz_spin].value.to_i
+        }
+        bar_cfg['spacing']   = ctrls[:spn_spin].value.to_i
+        sel = []
+        store = ctrls[:store]
+        store.each do |m, path, iter|
+          sel << store.get_value(iter, 0).to_s if store.get_value(iter, 1)
+        end
+        bar_cfg['buttons'] = sel
+      end
+
+      # persist & reload all bars
+      File.write(BarBar::CONFIG_FILE, @config.to_yaml)
+      BarBar.initialize
+      destroy
+    end
+
+    cancel_btn.signal_connect('clicked') { destroy }
+
+    show_all
+
+    if selected_bar_id && @bar_tabs.key?(selected_bar_id)
+      page_widget = @bar_tabs[selected_bar_id]
+      idx = notebook.page_num(page_widget)
+      # only set if it’s a valid index
+      notebook.current_page = idx if idx && idx >= 0
+    end
+  end
+
+  def set_active_by_text(combo, text)
+    combo.model.each do |model, path, iter|
+      if iter[0] == text
+        combo.active = path.indices.first
+        break
+      end
+    end
+  end
+  
+  def build_button_manager_tab
+    # 1) grab all the existing button defs
+    defs     = BarBar.load_button_configs
+    all_keys = defs.keys.sort
+
+    # 2) create main grid
+    grid = Gtk::Grid.new
+    grid.column_spacing = 8
+    grid.row_spacing    = 6
+    grid.margin = 12
+
+    # 3) Row 0: key selector
+    key_sel = Gtk::ComboBoxText.new
+    key_sel.append_text('<< New >>')
+    all_keys.each { |k| key_sel.append_text(k) }
+    key_sel.active = 0
+    grid.attach(Gtk::Label.new('Button Key:'), 0, 0, 1, 1)
+    grid.attach(key_sel,                         1, 0, 3, 1)
+
+    # 4) Rows 1–6: basic fields
+    name_e   = Gtk::Entry.new
+    cat_e    = Gtk::Entry.new
+    img_combo= Gtk::ComboBoxText.new
+    [name_e, cat_e, img_combo].each { |w| w.hexpand = true }
+
+    grid.attach(Gtk::Label.new('Name:'),            0, 1, 1, 1); grid.attach(name_e,    1, 1, 3, 1)
+    grid.attach(Gtk::Label.new('Category:'),  0, 2, 1, 1); grid.attach(cat_e,     1, 2, 3, 1)
+    grid.attach(Gtk::Label.new('Image Base:'),      0, 3, 1, 1); grid.attach(img_combo, 1, 3, 3, 1)
+
+    # populate image choices
+    Dir.glob(File.join(BarBar::ICON_FOLDER, '*.png')).each do |f|
+      base = File.basename(f, '.png')
+      img_combo.append_text(base)
+    end
+
+    # 5) Rows 4–10: state-frames in a sub-notebook
+    state_keys = %w[inactive_ready inactive_unready active_ready active_unready]
+    total_icons = BarBar::ICONS_PER_ROW * BarBar::ICONS_PER_ROW
+    state_nb = Gtk::Notebook.new
+    state_widgets = {}
+
+    state_keys.each do |st_key|
+      fg = Gtk::Grid.new
+      fg.row_spacing    = 6
+      fg.column_spacing = 6
+      fg.margin_bottom = 6
+
+      preview = Gtk::Image.new
+      preview.set_size_request(64, 64)
+      fg.attach(preview, 2, 0, 4, 2)
+
+      vcombo = Gtk::ComboBoxText.new
+      BarBar::VARIANTS.each { |v| vcombo.append_text(v) }
+      vcombo.active = 0
+      fg.attach(Gtk::Label.new('Variant:'),   0, 0, 1, 1)
+      fg.attach(vcombo,                       1, 0, 1, 1)
+
+      ispin = Gtk::SpinButton.new(1, total_icons, 1)
+      fg.attach(Gtk::Label.new('Icon #:'),    0, 1, 1, 1)
+      fg.attach(ispin,                        1, 1, 1, 1)
+      
+      cmd_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Command:'),   0, 2, 1, 1)
+      fg.attach(cmd_e,                        1, 2, 54, 1)
+
+      gc_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Group Cmd:'), 0, 3, 1, 1)
+      fg.attach(gc_e,                         1, 3, 54, 1)
+
+      cond_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Condition:'), 0, 4, 1, 1)
+      fg.attach(cond_e,                       1, 4, 54, 1)
+
+      timer_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Timer:'),     0, 5, 1, 1)
+      fg.attach(timer_e,                      1, 5, 54, 1)
+
+      tip_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Tooltip:'),   0, 6, 1, 1)
+      fg.attach(tip_e,                        1, 6, 54, 1)
+
+      frame = Gtk::Frame.new(st_key)
+      frame.add(fg)
+      state_nb.append_page(frame, Gtk::Label.new(st_key))
+
+      state_widgets[st_key] = {
+        variant:       vcombo,
+        icon:          ispin,
+        command:       cmd_e,
+        group_command: gc_e,
+        condition:     cond_e,
+        timer:         timer_e,
+        tooltip:       tip_e,
+        preview:       preview
+      }
+
+      updater = -> {
+        base    = img_combo.active_text
+        variant = vcombo.active_text || ''
+        num     = ispin.value_as_int
+        file    = File.join(BarBar::ICON_FOLDER, "#{base}#{variant}.png")
+        if File.exist?(file)
+          pix = GdkPixbuf::Pixbuf.new(file: file)
+          cx  = (num - 1) % BarBar::ICONS_PER_ROW
+          ry  = (num - 1) / BarBar::ICONS_PER_ROW
+          sub = pix.subpixbuf(
+            cx * BarBar::ICON_WIDTH,
+            ry * BarBar::ICON_HEIGHT,
+            BarBar::ICON_WIDTH,
+            BarBar::ICON_HEIGHT
+          )
+          thumb = sub.scale_simple(64, 64, GdkPixbuf::InterpType::BILINEAR)
+          preview.set_from_pixbuf(thumb)
+        else
+          preview.clear
+        end
+      }
+
+      img_combo.signal_connect('changed') { updater.call }
+      vcombo.signal_connect('changed') { updater.call }
+      ispin.signal_connect('value-changed') { updater.call }
+    end
+
+    grid.attach(state_nb, 0, 4, 4, 7)
+
+    save_btn = Gtk::Button.new(label: 'Save Button Definition')
+    grid.attach(save_btn, 0, 11, 4, 1)
+
+    load_def = lambda do |selected_key|
+      data = defs[selected_key] || {}
+      name_e.text  = data['name'].to_s
+      cat_e.text   = Array(data['category']).join(', ')
+      set_active_by_text(img_combo, data['image'].to_s)
+      state_widgets.each do |st, w|
+        sd = data.dig('states', st.to_s) || {}
+        w[:condition].text     = sd['condition'].to_s
+        set_active_by_text(w[:variant],   sd['variant'].to_s)
+        w[:icon].value         = sd['icon'].to_i
+        w[:tooltip].text       = sd['tooltip'].to_s
+        w[:timer].text         = sd['timer'].to_s
+        w[:command].text       = sd['command'].to_s
+        w[:group_command].text = sd['group_command'].to_s
+      end
+    end
+
+    key_sel.signal_connect('changed') { load_def.call(key_sel.active_text) }
+    load_def.call(key_sel.active_text)
+
+    save_btn.signal_connect('clicked') do
+      key = key_sel.active_text
+      if key == '<< New >>'
+        key = name_e.text.strip.downcase.gsub(/\s+/, '_')
+        defs[key] = {}
+        key_sel.append_text(key)
+      end
+
+      # build up the hash
+      states_hash = state_widgets.each_with_object({}) do |(st, w), h|
+        h[st.to_s] = {
+          'variant'       => w[:variant].active_text,
+          'icon'          => w[:icon].value.to_i,
+          'command'       => w[:command].text,
+          'group_command' => w[:group_command].text,
+          'condition'     => w[:condition].text,
+          'timer'         => w[:timer].text,
+          'tooltip'       => w[:tooltip].text
+        }
+      end  
+
+      defs[key] = {
+        'name'      => name_e.text,
+        'category'  => cat_e.text.split(',').map(&:strip),
+        'image'     => img_combo.active_text,
+        'states'    => states_hash
+      }
+
+      BarBar.instance_variable_set(:@button_configs, defs)
+      BarBar.save_button_configs
+      set_active_by_text(key_sel, key)
+    end
+
+    # return the tab page + controls if you need them
+    [grid, { selector: key_sel }]
+  end
+
+  def build_browse_icons_tab
+    # gather all distinct image bases
+    images = Dir.glob(File.join(BarBar::ICON_FOLDER,'*.png'))
+                .map { |f| File.basename(f, '.png') }
+                .uniq
+                .sort
+  
+    # layout
+    vbox = Gtk::Box.new(:vertical, 6)
+    vbox.margin = 12
+  
+    # row selector & image dropdown
+    ctrl = Gtk::Box.new(:horizontal, 6)
+    img_combo = Gtk::ComboBoxText.new
+    images.each { |img| img_combo.append_text(img) }
+    img_combo.active = 0
+    ctrl.pack_start(Gtk::Label.new('Sprite Map:'), expand: false, fill: false, padding: 0)
+    ctrl.pack_start(img_combo, expand: false, fill: false, padding: 0)
+  
+    max_rows = BarBar::ICONS_PER_ROW
+    row_spin = Gtk::SpinButton.new(1, max_rows, 1)
+    ctrl.pack_start(Gtk::Label.new('Row:'), expand: false, fill: false, padding: 0)
+    ctrl.pack_start(row_spin, expand: false, fill: false, padding: 0)
+  
+    range_lbl = Gtk::Label.new('')
+    ctrl.pack_start(range_lbl, expand: true, fill: true, padding: 0)
+  
+    vbox.pack_start(ctrl, expand: false, fill: false, padding: 0)
+  
+    # scrollable grid
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    grid   = Gtk::Grid.new
+    grid.row_spacing    = 4
+    grid.column_spacing = 4
+    scroll.add(grid)
+    vbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+  
+    # helper to render one row of icons
+    render = lambda do
+      grid.each { |c| grid.remove(c) }
+      base = img_combo.active_text
+      file = File.join(BarBar::ICON_FOLDER, "#{base}.png")
+      pix  = GdkPixbuf::Pixbuf.new(file: file)
+      row  = row_spin.value_as_int - 1
+      start = row * BarBar::ICONS_PER_ROW
+  
+      BarBar::ICONS_PER_ROW.times do |i|
+        sub = pix.subpixbuf(i * BarBar::ICON_WIDTH, row * BarBar::ICON_HEIGHT,
+                            BarBar::ICON_WIDTH, BarBar::ICON_HEIGHT)
+        thumb = sub.scale_simple(75, 75, GdkPixbuf::InterpType::BILINEAR)
+        eb = Gtk::EventBox.new.add(Gtk::Image.new(pixbuf: thumb))
+        grid.attach(eb, i % 8, i / 8, 1, 1)
+      end
+  
+      range_lbl.text = "Icons #{start + 1}–#{start + BarBar::ICONS_PER_ROW}"
+      grid.show_all
+    rescue
+    end
+  
+    img_combo.signal_connect('changed') { render.call }
+    row_spin.signal_connect('value-changed') { render.call }
+    render.call
+  
+    vbox
+  end
+
+  # Build one tab’s content for editing a single bar
+  def build_bar_tab(bar_cfg)
+    #grid = Gtk::Grid.new(column_spacing: 8, row_spacing: 6, margin: 12)
+    grid = Gtk::Grid.new
+    grid.column_spacing = 8
+    grid.row_spacing = 6
+    grid.set_margin_top(12)
+    grid.set_margin_bottom(12)
+    grid.set_margin_start(12)
+    grid.set_margin_end(12)
+
+    # Name
+    grid.attach(Gtk::Label.new('Name:'), 0,0,1,1)
+    name_entry = Gtk::Entry.new
+    name_entry.text = bar_cfg['name']
+    grid.attach(name_entry, 1,0,2,1)
+
+    # Enabled
+    enabled_cb = Gtk::CheckButton.new
+    enabled_cb.label = 'Enabled'
+    enabled_cb.active = bar_cfg['enabled']
+    grid.attach(enabled_cb, 0,1,1,1)
+
+    # Position
+    grid.attach(Gtk::Label.new('X:'), 0,2,1,1)
+    x_spin = Gtk::SpinButton.new(0, 5000, 1)
+    x_spin.value = bar_cfg.dig('position','x') || 100
+    grid.attach(x_spin, 1,2,1,1)
+
+    grid.attach(Gtk::Label.new('Y:'), 2,2,1,1)
+    y_spin = Gtk::SpinButton.new(0, 5000, 1)
+    y_spin.value = bar_cfg.dig('position','y') || 100
+    grid.attach(y_spin, 3,2,1,1)
+
+    # Size: cols, rows, icon_size, spacing
+    grid.attach(Gtk::Label.new('Cols:'), 0,3,1,1)
+    cols_spin = Gtk::SpinButton.new(1, 20, 1)
+    cols_spin.value = bar_cfg.dig('size','cols') || 10
+    grid.attach(cols_spin, 1,3,1,1)
+
+    grid.attach(Gtk::Label.new('Rows:'), 2,3,1,1)
+    rows_spin = Gtk::SpinButton.new(1,10,1)
+    rows_spin.value = bar_cfg.dig('size','rows') || 1
+    grid.attach(rows_spin, 3,3,1,1)
+
+    grid.attach(Gtk::Label.new('Icon Size:'), 0,4,1,1)
+    isz_spin = Gtk::SpinButton.new(16,128,1)
+    isz_spin.value = bar_cfg.dig('size','icon_size') || 64
+    grid.attach(isz_spin, 1,4,1,1)
+
+    grid.attach(Gtk::Label.new('Spacing:'), 2,4,1,1)
+    spn_spin = Gtk::SpinButton.new(0,20,1)
+    spn_spin.value = bar_cfg['spacing'] || 2
+    grid.attach(spn_spin, 3,4,1,1)
+
+    # Button Picker: a ListStore + TreeView of all available icon keys
+    all_keys = BarBar.load_button_configs.keys.sort
+    store = Gtk::ListStore.new(String, FalseClass)
+    all_keys.each do |k|
+      iter = store.append
+      iter[0] = k
+      iter[1] = bar_cfg['buttons'].include?(k)
+    end
+    tv = Gtk::TreeView.new(store)
+    renderer_text = Gtk::CellRendererText.new
+    col_text = Gtk::TreeViewColumn.new('Button', renderer_text, text: 0)
+    tv.append_column(col_text)
+    renderer_toggle = Gtk::CellRendererToggle.new
+    toggle_col = Gtk::TreeViewColumn.new('Include', renderer_toggle, active: 1)
+    renderer_toggle.signal_connect('toggled') do |r, path|
+      iter = store.get_iter(path)
+      iter[1] = !iter[1]
+    end
+    tv.append_column(toggle_col)
+    sel    = tv.selection
+    up_btn = Gtk::Button.new(label: '↑')
+    dn_btn = Gtk::Button.new(label: '↓')
+
+    up_btn.signal_connect('clicked') do
+      if iter = sel.selected
+        path = store.get_path(iter)
+        idx  = path.indices[0]
+        if idx > 0
+          above = store.iter_nth_child(nil, idx - 1)
+          swap_rows(store, iter, above)
+          sel.select_path(store.get_path(above))
+        end
+      end
+    end
+
+    dn_btn.signal_connect('clicked') do
+      if iter = sel.selected
+        path = store.get_path(iter)
+        idx = path.indices[0]
+        total = store.iter_n_children(nil)
+        if idx < total - 1
+          below = store.iter_nth_child(nil, idx + 1)
+          swap_rows(store, iter, below)
+          sel.select_path(store.get_path(below))
+        end
+      end
+    end
+
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    scroll.set_min_content_height(200)
+    scroll.set_vexpand(true)
+    scroll.add(tv)
+
+    hbox = Gtk::Box.new(:horizontal, 4)
+    hbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+    btn_box = Gtk::Box.new(:vertical, 2)
+    btn_box.pack_start(up_btn, expand: false, fill: false, padding: 2)
+    btn_box.pack_start(dn_btn, expand: false, fill: false, padding: 2)
+    hbox.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+    ctrls = {
+      name_entry: name_entry,
+      enabled_cb: enabled_cb,
+      x_spin:     x_spin,
+      y_spin:     y_spin,
+      cols_spin:  cols_spin,
+      rows_spin:  rows_spin,
+      isz_spin:   isz_spin,
+      spn_spin:   spn_spin,
+      store:      store
+    }
+
+      # —— NEW: Category filter —— 
+    # 1) load definitions & extract unique categories
+    defs       = BarBar.load_button_configs
+    categories = defs.values.flat_map { |cfg| Array(cfg['category']) }.compact.uniq.sort
+
+    # 2) build combo
+    combo = Gtk::ComboBoxText.new
+    # combo.margin_button = 8 # maybe remove
+    combo.append_text('All')
+    categories.each { |cat| combo.append_text(cat) }
+    combo.active = 0
+
+    # 3) attach to grid at row 5
+    grid.attach(Gtk::Label.new('Category:'), 0, 5, 1, 1)
+    grid.attach(combo,                     1, 5, 3, 1)
+    # ————————————————————
+
+    # —— BUTTONS list now starts at row 6 ——
+    all_keys = defs.keys.sort
+    store    = Gtk::ListStore.new(String, FalseClass)
+    # initial population (All)
+    all_keys.each do |k|
+      iter       = store.append
+      iter[0], iter[1] = k, bar_cfg['buttons'].include?(k)
+    end
+
+    # 4) re-populate on category change
+    combo.signal_connect('changed') do |c|
+      selected = c.active_text
+      puts " Combo changed to: #{selected}"
+      store.clear
+      all_keys.each do |k|
+        cfg = defs[k]
+        next if selected != 'All' && !Array(cfg['category']).include?(selected)
+        iter = store.append
+        iter[0],iter[1] = k, bar_cfg['buttons'].include?(k)
+      end
+    end
+
+    tv = Gtk::TreeView.new(store)
+    renderer_text = Gtk::CellRendererText.new
+    col_text = Gtk::TreeViewColumn.new('Button', renderer_text, text: 0)
+    tv.append_column(col_text)
+    renderer_toggle = Gtk::CellRendererToggle.new
+    toggle_col = Gtk::TreeViewColumn.new('Include', renderer_toggle, active: 1)
+    renderer_toggle.signal_connect('toggled') do |r, path|
+      iter = store.get_iter(path)
+      iter[1] = !iter[1]
+    end
+    tv.append_column(toggle_col)
+    sel    = tv.selection
+    up_btn = Gtk::Button.new(label: '↑')
+    dn_btn = Gtk::Button.new(label: '↓')
+
+    up_btn.signal_connect('clicked') do
+      if iter = sel.selected
+        path = store.get_path(iter)
+        idx  = path.indices[0]
+        if idx > 0
+          above = store.iter_nth_child(nil, idx - 1)
+          swap_rows(store, iter, above)
+          sel.select_path(store.get_path(above))
+        end
+      end
+    end
+
+    dn_btn.signal_connect('clicked') do
+      if iter = sel.selected
+        path = store.get_path(iter)
+        idx = path.indices[0]
+        total = store.iter_n_children(nil)
+        if idx < total - 1
+          below = store.iter_nth_child(nil, idx + 1)
+          swap_rows(store, iter, below)
+          sel.select_path(store.get_path(below))
+        end
+      end
+    end
+
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    scroll.set_min_content_height(200)
+    scroll.set_vexpand(true)
+    scroll.add(tv)
+
+    hbox = Gtk::Box.new(:horizontal, 4)
+    hbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+    btn_box = Gtk::Box.new(:vertical, 2)
+    btn_box.pack_start(up_btn, expand: false, fill: false, padding: 2)
+    btn_box.pack_start(dn_btn, expand: false, fill: false, padding: 2)
+    hbox.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+    # scrolled hbox at rows 6
+    grid.attach(hbox,                    0, 6, 4, 4)
+
+    ctrls = {
+      name_entry: name_entry,
+      enabled_cb: enabled_cb,
+      x_spin:     x_spin,
+      y_spin:     y_spin,
+      cols_spin:  cols_spin,
+      rows_spin:  rows_spin,
+      isz_spin:   isz_spin,
+      spn_spin:   spn_spin,
+      store:      store
+    }
+
+    [grid, ctrls]
+  end
+
+  # Add a brand-new empty bar
+  def add_new_bar_tab(notebook)
+    new_id = "bar#{Time.now.to_i}"
+    pos = if @parent_window
+      x,y = @parent_window.position
+      { 'x' => x, 'y' => y }
+    else
+      { 'x' => 100, 'y' => 100 }
+    end
+
+    new_bar = {
+      'id'=> new_id,
+      'name'=> 'New Bar',
+      'enabled'=> true,
+      'position'=> pos,
+      'size'=>{'cols'=>10,'rows'=>1,'icon_size'=>64},
+      'spacing'=>2,
+      'buttons'=>[]
+    }
+    @config['bars'] << new_bar
+    page, ctrls = build_bar_tab(new_bar)
+    @bar_tabs[new_id] = page
+    @controls[new_id] = ctrls
+    notebook.append_page(page, Gtk::Label.new(new_bar['name']))
+    show_all
+  end
+
+  private
+  def swap_rows(store, iter1, iter2)
+    (0...store.n_columns).each do |col|
+      v1 = store.get_value(iter1, col)
+      v2 = store.get_value(iter2, col)
+      store.set_value(iter1, col, v2)
+      store.set_value(iter2, col, v1)
+    end
+  end
+end
+
+module BarBar
+  # ─────────────────────────────────────────────
+  # 1) ALL your constants & helper methods
+  ICON_FOLDER   ||= File.join(DATA_DIR, 'icons')
+  CONFIG_FILE   ||= File.join(ICON_FOLDER, "#{Char.name}_bars.yaml")
+  BUTTON_CFG    ||= File.join(ICON_FOLDER, "#{Char.name}_buttons.yaml")
+
+  ICON_WIDTH    ||= 64
+  ICON_HEIGHT   ||= 64
+  ICONS_PER_ROW ||= 2048 / ICON_WIDTH
+
+  VARIANTS      ||= [
+    '', '_green', '_blue', '_red',
+    '_greyscale', '_greyscale_green', '_greyscale_blue', '_greyscale_red'
+  ]
+
+  @@pixbuf_cache = {}
+  @@bar_windows  = []
+  @@config       = {}
+  @@disp_icon_w = ICON_WIDTH
+  @@disp_icon_h = ICON_HEIGHT
+  @@css_provider = Gtk::CssProvider.new
+  @close_window  = false
+
+  # load individual button definitions
+  # def self.load_button_configs
+  #   @button_configs ||= YAML.load_file(BUTTON_CFG)
+  # end
+  def self.load_button_configs
+    unless File.exist?(BUTTON_CFG)
+      Lich::Messaging.msg("No button file detected. Creating one.")
+      return {}
+    end
+    @button_configs ||= File.exist?(BUTTON_CFG) ? YAML.load_file(BUTTON_CFG) : {}
+  end
+  
+  def self.save_button_configs
+    require 'fileutils'
+    dir = File.dirname(BUTTON_CFG)
+    FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+    File.write(BUTTON_CFG, load_button_configs.to_yaml)
+  end
+
+  def self.config_for(key)
+    load_button_configs
+    @button_configs[key]
+  end
+  
+  def self.config
+    @@config
+  end
+
+  def self.apply_css
+    dark = @@config.fetch('dark_mode', false)
+
+    base_css = if dark
+      <<~CSS
+        window, button, menu {
+          background-color: #2E2E2E;
+          color:            #DDDDDD;
+        }
+        button {
+          border-width: 0;
+          padding:      0;
+        }
+      CSS
+    else
+      "" 
+    end
+
+    timer_css = <<~CSS
+      .skillbar-timer {
+        font-size: #{@@disp_icon_h/2}px;
+        font-weight: bold;
+        color: yellow;
+        background-color: rgba(0,0,0,0.3);
+        padding: 1px 2px;
+        border-radius: 3px;
+      }
+      .skillbar-timer-critical {
+        color: #FF5555;
+      }
+    CSS
+
+    reset_css = <<~CSS
+      button {
+        padding: 0;
+        border-width: 0;
+      }
+    CSS
+
+    @@css_provider.load(data: base_css + timer_css + reset_css)
+    screen = Gdk::Screen.default
+    Gtk::StyleContext.add_provider_for_screen(
+      screen,
+      @@css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+  end
+
+  def self.create_icon(cfg, state_sym, width = @@disp_icon_w, height = @@disp_icon_h)
+    begin
+      states = cfg['states'] || {}
+      state_cfg = states[state_sym.to_s] || {}
+
+      base = cfg['image']
+      variant = state_cfg['variant'] || ''
+      icon_num = (state_cfg['icon'] || 1).to_i
+
+      return Gtk::Image.new unless base
+
+      key = "#{base}#{variant}"
+
+      unless @@pixbuf_cache[key]
+        file = File.join(ICON_FOLDER, "#{base}#{variant}.png")
+        return Gtk::Image.new unless File.exist?(file)
+        @@pixbuf_cache[key] = GdkPixbuf::Pixbuf.new(file: file)
+      end
+
+      pixbuf = @@pixbuf_cache[key]
+      idx = icon_num - 1
+      cx = idx % ICONS_PER_ROW
+      ry = idx / ICONS_PER_ROW
+
+      crop = pixbuf.subpixbuf(cx * ICON_WIDTH, ry * ICON_HEIGHT, ICON_WIDTH, ICON_HEIGHT)
+      small = crop.scale_simple(
+        width,
+        height,
+        GdkPixbuf::InterpType::BILINEAR
+      )
+      Gtk::Image.new(pixbuf: small)
+    rescue => e
+      puts "create_icon error: #{e}"
+      Gtk::Image.new
+    end
+  end
+
+  def self.determine_state(cfg)
+    states_cfg = cfg['states'] || {}
+
+    # fixed priority order:
+    %i[active_ready active_unready inactive_ready inactive_unready].each do |state_sym|
+      spec = states_cfg[state_sym.to_s] || {}
+      cond = spec['condition']
+      next unless cond
+
+      # eval the user’s Ruby expression
+      begin
+        return state_sym if eval(cond)
+      rescue => e
+        puts "determine_state eval error for #{state_sym}: #{e}"
+      end
+    end
+ 
+    # fallback
+    :inactive_unready
+  end
+  
+  def self.save_window_settings(bar_cfg, window)
+    bar_cfg['position'] ||= {}
+    x, y = window.position
+    bar_cfg['position']['x'] = x
+    bar_cfg['position']['y'] = y
+    bar_cfg['window'] ||= {}
+    w, h = window.size
+    bar_cfg['window']['width']     = w
+    bar_cfg['window']['height']    = h
+    bar_cfg['window']['decorated'] = window.decorated?
+    File.write(CONFIG_FILE, @@config.to_yaml)
+  end
+
+  def self.destroy_window
+    @@bar_windows.each(&:destroy)
+    @@bar_windows.clear
+  end
+
+  def self.request_close
+    @close_window = true
+  end
+
+  def self.close_requested?
+    @close_window
+  end
+
+  def self.show_timers?
+    @@config.fetch('show_timers', true)
+  end
+
+  def self.bar_windows
+    @@bar_windows
+  end
+
+  # ─────────────────────────────────────────────
+  # 2) The BarWindow class _inside_ BarBar
+  class BarWindow
+    def initialize(bar_cfg)
+      @cfg         = bar_cfg
+      @cols        = bar_cfg.dig('size','cols')       || 1
+      @rows        = bar_cfg.dig('size','rows')       || 1
+      @disp_icon_w = bar_cfg.dig('size','icon_size')  || ICON_WIDTH
+      @spacing     = bar_cfg['spacing']               || 0
+      @keys        = bar_cfg['buttons']               || []
+
+      build_window
+      build_buttons
+      start_timer
+    end
+
+    def build_window
+      @win = Gtk::Window.new(@cfg['name'] || 'Bar')
+      ws = @cfg['window'] || {}
+      default_w = @cols * @disp_icon_w + (@cols - 1) * @spacing
+      default_h = @rows * @disp_icon_w + (@rows - 1) * @spacing
+      win_w = ws['width'] || default_w
+      win_h = ws['height'] || default_h
+      @win.set_default_size(win_w, win_h)
+      if (p=@cfg['position'])
+        @win.move(p['x'], p['y']) if p['x'] && p['y']
+      end
+      atop = @cfg.dig('window', 'always_on_top')
+      @win.decorated = @cfg.dig('window','decorated').nil? ? true : @cfg['window']['decorated']
+      @win.set_keep_above(atop.nil? ? true : atop)
+
+      @last_click_pos = nil
+      menu = Gtk::Menu.new
+
+      config_item = Gtk::MenuItem.new(label: 'Configure BarBar')
+      config_item.signal_connect('activate') do
+        ConfigWindow.new(BarBar.config, @win, @cfg['id'])
+      end
+      menu.append(config_item)
+
+      toggle_border = Gtk::MenuItem.new(label: 'Toggle Window Border')
+      toggle_border.signal_connect('activate') { toggle_decorations }
+      menu.append(toggle_border)
+
+      top_item = Gtk::CheckMenuItem.new(label: 'Always on top')
+      top_item.active = (@cfg.dig('window','always_on_top').nil? ? true : @cfg['window']['always_on_top'])
+      top_item.signal_connect('toggled') do
+        @win.set_keep_above(top_item.active?)
+        @cfg['window']['always_on_top'] = top_item.active?
+        BarBar.save_window_settings(@cfg, @win)
+      end
+      menu.append(top_item)
+
+      dark_item = Gtk::CheckMenuItem.new(label: 'Dark Mode')
+      dark_item.active = BarBar.class_variable_get(:@@config).fetch('dark_mode', false)
+      dark_item.signal_connect('toggled') do
+        BarBar.class_variable_get(:@@config)['dark_mode'] = dark_item.active?
+        File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
+        BarBar.apply_css
+      end
+      menu.append(dark_item)
+
+      timer_item = Gtk::CheckMenuItem.new(label: 'Show Timers')
+      timer_item.active = BarBar.show_timers?
+      timer_item.signal_connect('toggled') do
+        BarBar.class_variable_get(:@@config)['show_timers'] = timer_item.active?
+        File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
+        BarBar.bar_windows.each do |bw|
+          bw.instance_variable_get(:@buttons).each_value do |info|
+            info[:btn].queue_draw
+          end
+        end
+      end
+      menu.append(timer_item)
+
+      menu.show_all
+      @win.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
+      @win.signal_connect('button-press-event') do |w, event|
+        if event.button == 3
+          @last_click_pos = [event.x_root.to_i, event.y_root.to_i]
+          menu.popup_at_pointer(event)
+          true
+        else
+          false
+        end
+      end
+
+      @win.signal_connect('delete-event') do |w, _|
+        BarBar.save_window_settings(@cfg, @win)
+        BarBar.request_close
+        true
+      end
+      @win.signal_connect('configure-event') do |w, _event|
+        BarBar.save_window_settings(@cfg, w)
+        false
+      end
+    end
+
+    def build_buttons
+      scroll = Gtk::ScrolledWindow.new
+      scroll.set_policy(:automatic, :automatic)
+      @win.add(scroll)
+
+      grid = Gtk::Grid.new
+      grid.row_spacing    = @spacing
+      grid.column_spacing = @spacing
+      scroll.add(grid)
+
+      @buttons = {}
+
+      @keys.each_with_index do |key, idx|
+        next unless (btn_cfg = BarBar.config_for(key))
+        img_widget = BarBar.create_icon(btn_cfg, :inactive_ready, @disp_icon_w, @disp_icon_w)
+
+
+        overlay = Gtk::Overlay.new
+        overlay.add(img_widget)
+
+        timer_lbl = Gtk::Label.new("")
+        timer_lbl.set_halign(:center)
+        timer_lbl.set_valign(:end)
+        timer_lbl.style_context.add_class("skillbar-timer")
+        timer_lbl.hide
+        overlay.add_overlay(timer_lbl)
+
+        btn = Gtk::Button.new
+        btn.set_relief(:none)
+        btn.add(overlay)
+        btn.tooltip_text = btn_cfg['name']
+        btn.signal_connect('clicked') do
+          st = BarBar.determine_state(btn_cfg)
+          state_cfg = btn_cfg.dig('states', st.to_s) || {}
+
+          if (c = state_cfg['command']) && !c.empty?
+            Game._puts("<c>#{c}") 
+            puts("> #{c}")
+          end
+          # These should be gated behind Group.members.empty?
+          # if (gc = state_cfg['group_command']) && !gc.empty?
+          #   Game._puts("<c>#{gc}")
+          #   puts("> #{gc}")
+          # end
+        end
+
+        @buttons[key] = { btn: btn, img_widget: img_widget, lbl_widget: timer_lbl, cfg: btn_cfg, state: nil }
+
+        c = idx % @cols
+        r = idx / @cols
+        grid.attach(btn, c, r, 1, 1)
+      end
+
+      @win.show_all
+    end
+
+    def start_timer
+      @timer = GLib::Timeout.add(250) { update_buttons; true }
+    end
+
+    def format_time(sec)
+      case sec
+      when 0...100
+        "#{sec}s"
+      when 100...5940
+        # round to nearest minute
+        minutes = (sec/60.0).round
+        "#{minutes}m"
+      else
+        # round to nearest hour
+        hours = (sec/3600.0).round
+        "#{hours}h"
+      end
+    end
+
+    def update_buttons
+      @buttons.each do |_, info|
+        cfg = info[:cfg]
+        img = info[:img_widget]
+        lbl = info[:lbl_widget]
+
+        st = BarBar.determine_state(cfg)
+        if st != info[:last_state]
+          new_img = BarBar.create_icon(cfg, st, @disp_icon_w, @disp_icon_w)
+          img.set_from_pixbuf(new_img.pixbuf)
+          info[:last_state] = st
+        end
+
+        tstr = ''
+        if BarBar.show_timers?
+          st = BarBar.determine_state(cfg)
+          state_cfg = cfg.dig('states', st.to_s) || {}
+
+          if (expr = state_cfg['timer'])
+            rem = begin raw = eval(expr); Array(raw).first.to_i rescue 0 end
+            tstr = (rem > 0) ? rem.to_s : ''
+            # ctx = lbl.style_context
+            # if rem > 0 && rem <= 5
+            #   ctx.add_class("skillbar-timer-critical")
+            # else
+            #   ctx.remove_class("skillbar-timer-critical")
+            # end
+          end
+        end
+
+        if tstr.empty?
+          lbl.hide
+        else
+          lbl.text = format_time(tstr.to_i)
+          lbl.show
+        end
+      end
+    end
+
+    def destroy
+      GLib::Source.remove(@timer) if @timer
+      @win.destroy
+    end
+
+    def toggle_decorations
+      BarBar.save_window_settings(@cfg, @win)
+      @cfg['window']['decorated'] = !@win.decorated?
+      File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
+
+      @win.destroy
+      build_window
+      build_buttons
+      start_timer
+    end
+  end
+
+  # ─────────────────────────────────────────────
+  # 3) Top-level kickoff: load bars.yaml (or default), spin up windows
+  def self.initialize
+    Gtk.queue do
+      destroy_window
+      raw = File.exist?(CONFIG_FILE) ? YAML.load_file(CONFIG_FILE) : nil
+      if raw.is_a?(Hash) && raw['bars'].is_a?(Array)
+        @@config = raw
+      else
+        @@config = {
+          'bars' => [
+            {
+              'id' => 'default','name' => 'Main Bar', 'enabled' => true,
+              'position' => { 'x' => 100, 'y' => 100 },
+              'size' => { 'cols' => 10, 'rows' => 1, 'icon_size' => 64},
+              'spacing' => 2, 'buttons' => []
+            }
+          ]
+        }
+      end
+
+      apply_css
+      @@show_timers = @@config.fetch('show_timers', true)
+
+      # build a window per enabled bar
+      @@config['bars'].each do |bar|
+        next unless bar['enabled']
+        @@bar_windows << BarWindow.new(bar)
+      end
+    end
+  end
+end
+
+# finally launch it
+BarBar.initialize
+before_dying { Gtk.queue { BarBar.class_variable_get(:@@bar_windows).each(&:destroy) } }
+
+until BarBar.close_requested?
+  sleep(1)
+end
+exit
