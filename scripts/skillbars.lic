@@ -1,0 +1,264 @@
+=begin
+
+
+          author: elanthia-online
+    contributors: Nisugi
+            game: gemstone
+            tags: visual, icons, combat, ???
+         version: 0.1
+        required: Lich >= 5.6.2  maybe
+
+
+     Icons Packs: https://drive.google.com/drive/folders/1yoakKMzTLyVnDguuMpMD58U993sNieiV?usp=drive_link
+      Screenshot: https://drive.google.com/drive/folders/1W54WCHn7qsDDeyQTB09atayxLAPyINY9
+
+  Version Control:
+  v0.1
+  - alpha
+
+=end
+
+require 'gtk3'
+require 'yaml'
+
+module SkillBars
+  ICON_FOLDER   ||= File.join(DATA_DIR, 'icons')
+  CONFIG_FILE   ||= File.join(ICON_FOLDER, 'icon_settings.yaml')
+  ICON_WIDTH    ||= 64
+  ICON_HEIGHT   ||= 64
+  ICONS_PER_ROW ||= 2048 / 64
+  VARIANTS ||= [
+    '', '_green', '_blue', '_red',
+    '_greyscale', '_greyscale_green', '_greyscale_blue', '_greyscale_red'
+  ]
+
+  @@pixbuf_cache = {}
+  @@window = nil
+  @@timer_id = nil
+  @@config = {}
+  @close_window = false
+
+  def self.initialize
+    Gtk.queue do
+      destroy_window
+      @@config = File.exist?(CONFIG_FILE) ? YAML.load_file(CONFIG_FILE) : {}
+      build_window
+    end
+  end
+
+  def self.build_window
+    window_settings = @@config['window'] || {}
+
+    @@window = Gtk::Window.new('Skill Bars')
+    @@window.decorated = window_settings.fetch(:decorated, true)
+    @@window.set_keep_above(true)
+    @@window.set_default_size(
+      window_settings[:width] || (ICON_WIDTH * 10),
+      window_settings[:height] || (ICON_HEIGHT + 10)
+    )
+
+    if window_settings[:x] && window_settings[:y]
+      @@window.move(window_settings[:x], window_settings[:y])
+    end
+
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    @@window.add(scroll)
+
+    build_menu
+    build_buttons(scroll)
+
+    @@window.signal_connect('delete-event') do |w, _|
+      save_window_settings
+      @close_window = true
+    end
+
+    @@window.show_all
+    @@window.present
+  end
+
+  def self.build_menu
+    menu = Gtk::Menu.new
+
+    toggle_item = Gtk::MenuItem.new(label: 'Toggle Window Border')
+    toggle_item.signal_connect('activate') do
+      toggle_decorations
+    end
+
+    menu.append(toggle_item)
+    menu.show_all
+
+    @@window.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
+    @@window.signal_connect('button-press-event') do |w, event|
+      if event.button == 3
+        menu.popup_at_pointer(event)
+        true
+      else
+        false
+      end
+    end
+  end
+
+  def self.build_buttons(scroll)
+    grid = Gtk::Grid.new
+    grid.row_spacing = 6
+    grid.column_spacing = 6
+    scroll.add(grid)
+  
+    buttons = {}
+  
+    @@config.select { |k,v| k.start_with?('button') }.sort.each_with_index do |(key, button_cfg), idx|
+      next unless button_cfg && button_cfg['image']
+  
+      # Check for required fields
+      unless button_cfg['active'] && button_cfg['available']
+        puts "Skipping #{key} — missing active/available fields."
+        next
+      end
+  
+      btn = Gtk::Button.new
+      btn.tooltip_text = button_cfg['name'] || key
+  
+      icon = create_icon(button_cfg, :inactive_ready)
+      btn.set_image(icon)
+  
+      btn.signal_connect('clicked') do
+        if button_cfg['command'] && !button_cfg['command'].empty?
+          Game._puts "<c>#{button_cfg['command']}"
+          puts("> #{button_cfg['command']}")
+        end
+      end
+  
+      buttons[key] = { button: btn, config: button_cfg, last_state: nil }
+  
+      x = idx % 10
+      y = idx / 10
+      grid.attach(btn, x, y, 1, 1)
+    end
+  
+    @@timer_id = GLib::Timeout.add(250) do
+      buttons.each do |key, info|
+        btn = info[:button]
+        cfg = info[:config]
+        last_state = info[:last_state]
+        new_state = determine_state(cfg)
+        if new_state != last_state
+          icon = create_icon(cfg, new_state)
+          btn.set_image(icon)
+          tooltip = cfg.dig('states', new_state.to_s, 'tooltip') || cfg['name']
+          btn.tooltip_text = tooltip
+          info[:last_state] = new_state
+        end
+      end
+      true
+    end
+  end
+  
+
+  def self.toggle_decorations
+    @@config['window'] ||= {}
+  
+    # Save current position before destroying
+    if @@window
+      x, y = @@window.position
+      @@config['window'][:x] = x
+      @@config['window'][:y] = y
+    end
+  
+    # Save current decoration state
+    current = @@config['window'].fetch(:decorated, true)
+    @@config['window'][:decorated] = !current
+    File.write(CONFIG_FILE, @@config.to_yaml)
+  
+    destroy_window
+    build_window
+  end
+
+  def self.destroy_window
+    if @@timer_id
+      GLib::Source.remove(@@timer_id)
+      @@timer_id = nil
+    end
+    if @@window && @@window.visible?
+      @@window.destroy
+    end
+    @@window = nil
+  end
+
+  def self.save_window_settings
+    x, y = @@window.position
+    width, height = @@window.size
+    @@config['window'] ||= {}
+    @@config['window'][:x] = x
+    @@config['window'][:y] = y
+    @@config['window'][:width] = width
+    @@config['window'][:height] = height
+    @@config['window'][:decorated] = @@window.decorated?
+
+    File.write(CONFIG_FILE, @@config.to_yaml)
+  end
+
+  def self.create_icon(cfg, state_sym)
+    begin
+      states = cfg['states'] || {}
+      state_cfg = states[state_sym.to_s] || {}
+
+      base = cfg['image']
+      variant = state_cfg['variant'] || ''
+      icon_num = (state_cfg['icon'] || 1).to_i
+
+      return Gtk::Image.new unless base
+
+      key = "#{base}#{variant}"
+
+      unless @@pixbuf_cache[key]
+        file = File.join(ICON_FOLDER, "#{base}#{variant}.bmp")
+        return Gtk::Image.new unless File.exist?(file)
+        @@pixbuf_cache[key] = GdkPixbuf::Pixbuf.new(file: file)
+      end
+
+      pixbuf = @@pixbuf_cache[key]
+      idx = icon_num - 1
+      cx = idx % ICONS_PER_ROW
+      ry = idx / ICONS_PER_ROW
+
+      crop = pixbuf.subpixbuf(cx * ICON_WIDTH, ry * ICON_HEIGHT, ICON_WIDTH, ICON_HEIGHT)
+      Gtk::Image.new(pixbuf: crop)
+    rescue => e
+      puts "create_icon error: #{e}"
+      Gtk::Image.new
+    end
+  end
+
+  def self.determine_state(cfg)
+    begin
+      active = !!eval(cfg['active'])
+      available = !!eval(cfg['available'])
+
+      case [active, available]
+      when [false, true]
+        :inactive_unready
+      when [false, false]
+        :inactive_ready
+      when [true, false]
+        :active_ready
+      when [true, true]
+        :active_unready
+      else
+        :inactive_ready
+      end
+    rescue => e
+      puts "determine_state error: #{e}"
+      :inactive_unready
+    end
+  end
+
+  SkillBars.initialize
+  before_dying { Gtk.queue { SkillBars.destroy_window } }
+  until @close_window
+    sleep(1)
+  end
+  exit
+end
+
+
