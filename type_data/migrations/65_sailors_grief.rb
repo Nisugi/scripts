@@ -2,7 +2,6 @@ migrate :aggressive_npc do
   insert(:name, %{(?:algae-draped )?merrow oracle})
   insert(:name, %{(?:amaranthine )?kraken tentacle})
   insert(:name, %{(?:blubbery )?humpbacked merrow})
-  insert(:name, %{(?:brackish )?bilge mass})
   insert(:name, %{(?:fulminating )?stormborn primordial})
   insert(:name, %{(?:gigantic )?lightning whelk})
   insert(:name, %{(?:grey-plumed )?steelwing harpy})
@@ -18,6 +17,7 @@ migrate :undead, :aggressive_npc do
 end
 
 migrate :undead, :aggressive_npc, :noncorporeal do
+  insert(:name, %{(?:brackish )?bilge mass})
   insert(:name, %{(?:tenebrific )?wraith shark})
 end
 
@@ -42,9 +42,13 @@ migrate :gem, :gemshop do
   insert(:name, %{indigo seastone orb})
   insert(:name, %{metallic chunk of galena})
   insert(:name, %{mottled algae chalcedony})
+  insert(:name, %{pale nautilus half-shell})
   insert(:name, %{plum-flecked ruby zoisite})
+  insert(:name, %{porous muddy brown rhyolite})
   insert(:name, %{porous oily black stone})
+  insert(:name, %{ribbon-banded cabochon rodochrosite})
   insert(:name, %{rosette rhodonite block})
+  insert(:name, %{rust-hued grey lapis crucifer})
   insert(:name, %{sanguine pyrope teardrop})
   insert(:name, %{scaled indigo ammolite})
   insert(:name, %{smooth dolphin stone disc})
@@ -60,4 +64,8 @@ migrate :skin, :furrier do
   insert(:name, %{needle-thin trenchling tooth})
   insert(:name, %{trenchling teeth})
   insert(:name, %{(?:metallic )?harpy feather})
+end
+
+migrate :uncommon do
+  insert(:name, %{mummified shark heart})
 end
