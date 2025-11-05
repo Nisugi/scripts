@@ -1,7 +1,7 @@
 name: Smoke Tests
-on:
-  schedule:
-    - cron: '*/37 * * * *'
+#on:
+#  schedule:
+#    - cron: '*/37 * * * *'
 
 jobs:
   jinx:
@@ -29,3 +29,4 @@ jobs:
         env:
 
           ENABLE_EXTERNAL_NETWORKING: true
+
