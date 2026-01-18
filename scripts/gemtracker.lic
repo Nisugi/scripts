@@ -1,0 +1,1462 @@
+=begin
+  Gem value tracker - captures gem appraisals and provides statistics
+
+         author: Nisugi
+           game: Gemstone
+           tags: gems, appraisal, tracking, utility
+        version: 1.3.0
+   requirements:
+    - sequel gem
+    - terminal-table gem
+
+  Usage:
+    ;gemtracker                    - Start tracking (runs in background)
+    ;gemtracker help               - Show this help
+    ;gemtracker stats              - Show all gem statistics
+    ;gemtracker stats <gem>        - Show stats for specific gem
+    ;gemtracker rarity             - Show stats grouped by rarity
+    ;gemtracker rarity <level>     - Show gems of specific rarity
+    ;gemtracker quality            - Show stats grouped by quality
+    ;gemtracker quality <level>    - Show gems of specific quality
+    ;gemtracker recent [n]         - Show last n appraisals (default 20)
+    ;gemtracker search <gem>       - Detailed stats for matching gems
+    ;gemtracker matrix [gem]       - Quality vs value matrix view (alphabetical)
+    ;gemtracker matrix -v [gem]    - Matrix sorted by avg value (low to high)
+    ;gemtracker matrix -vd [gem]   - Matrix sorted by avg value (high to low)
+    ;gemtracker matrix -export     - Export matrix to CSV file
+    ;gemtracker matrix -vd -export - Combine sort and export flags
+    ;gemtracker list -v <value>    - List gems with avg value >= threshold
+    ;gemtracker list -vd <value>   - List gems with avg value <= threshold
+    ;gemtracker export [file]      - Export to CSV file
+    ;gemtracker char [name]        - Show stats for specific character
+    ;gemtracker clear              - Clear all data (with confirmation)
+
+  Google Sheets Integration:
+    ;gemtracker sheets setup       - Configure credentials and spreadsheet
+    ;gemtracker sheets status      - Show current configuration
+    ;gemtracker sheets push        - Push all data (matrix + raw + stats)
+    ;gemtracker sheets push matrix - Push matrix view only
+    ;gemtracker sheets push raw    - Push all appraisals only
+    ;gemtracker sheets push stats  - Push summary stats only
+
+  Rarity/quality values are captured dynamically - any new values the game
+  introduces will be tracked automatically.
+=end
+
+gems_to_load = ["sequel", "terminal-table"]
+failed_to_load = []
+gems_to_load.each { |gem|
+  unless Gem::Dependency.new(gem).matching_specs.max_by(&:version).nil?
+    require gem
+  else
+    failed_to_load.push(gem)
+  end
+}
+unless failed_to_load.empty?
+  echo "Requires Ruby gems: #{failed_to_load.join(", ")}"
+  echo "Please install the above gem(s) to run ;gemtracker"
+  exit
+end
+
+# Google Sheets API is optional - only required for sheets commands
+# Note: gem name is 'google-apis-sheets_v4' but require path is 'google/apis/sheets_v4'
+GOOGLE_SHEETS_AVAILABLE = begin
+  require 'google/apis/sheets_v4'
+  require 'googleauth'
+  true
+rescue LoadError
+  false
+end
+
+module GemTracker
+  @file = File.join($data_dir, "gemtracker.db")
+  DB = Sequel.sqlite(@file)
+
+  # Create table if it doesn't exist (v1.1 schema with rarity/quality)
+  DB.create_table?(:appraisals) do
+    primary_key :id
+    String   :gem_name
+    String   :rarity
+    String   :quality
+    Integer  :value
+    String   :character
+    String   :game
+    DateTime :created_at
+    Integer  :year
+    Integer  :month
+    Integer  :day
+  end
+
+  # Migration: add rarity/quality columns if missing (upgrade from v1.0)
+  unless DB[:appraisals].columns.include?(:rarity)
+    DB.alter_table(:appraisals) do
+      add_column :rarity, String
+      add_column :quality, String
+    end
+  end
+
+  # Migration: add purified column if missing (upgrade from v1.1)
+  unless DB[:appraisals].columns.include?(:purified)
+    DB.alter_table(:appraisals) do
+      add_column :purified, :boolean, default: false
+    end
+  end
+
+  Appraisals = DB[:appraisals]
+
+  # Flag for marking next appraisal as purified (set by purify.lic)
+  @mark_next_purified = false
+
+  def self.mark_next_purified!
+    @mark_next_purified = true
+  end
+
+  def self.mark_next_purified?
+    @mark_next_purified
+  end
+
+  def self.clear_purified_flag!
+    @mark_next_purified = false
+  end
+
+  # Regex to match gem appraisal output - captures rarity and quality dynamically
+  # Example: "You estimate that the violet sapphire is an infrequent gemstone of poor quality and worth approximately 750 silvers."
+  # High-quality gems (outstanding, superb, magnificent) end with "silvers!" instead of "silvers."
+  # The (?:an? )? handles "a common", "an uncommon", "an infrequent", etc.
+  APPRAISAL_REGEX = /You estimate that the (?<gem>.+?) is (?:an? )?(?<rarity>.+?) gemstone of (?<quality>.+?) quality and worth approximately (?<value>[\d,]+) silvers?[.!]/
+
+  def self.record_appraisal(gem_name, rarity, quality, value)
+    now = Time.now
+    purified = mark_next_purified?
+    clear_purified_flag!
+
+    appraisal = {
+      gem_name:   gem_name.strip.downcase,
+      rarity:     rarity.strip.downcase,
+      quality:    quality.strip.downcase,
+      value:      value,
+      character:  Char.name,
+      game:       XMLData.game,
+      created_at: now,
+      year:       now.year,
+      month:      now.month,
+      day:        now.day,
+      purified:   purified
+    }
+    Appraisals.insert(appraisal)
+    purified_str = purified ? " [PURIFIED]" : ""
+    echo "Recorded: #{gem_name} (#{rarity}, #{quality}) = #{with_commas(value)} silvers#{purified_str}"
+  end
+
+  def self.with_commas(num)
+    num.to_s.reverse.gsub(/(\d{3})(?=\d)/, '\\1,').reverse
+  end
+
+  # Known rarity order for sorting (lowest to highest)
+  RARITY_ORDER = [
+    'extremely common', 'very common', 'common', 'uncommon',
+    'infrequent', 'unusual', 'rare', 'very rare', 'extremely rare'
+  ].freeze
+
+  # Known quality order for sorting (lowest to highest)
+  QUALITY_ORDER = [
+    'very cheap', 'very poor', 'poor', 'below average', 'average',
+    'above average', 'fair', 'good', 'fine', 'exceptional',
+    'outstanding', 'superb', 'magnificent'
+  ].freeze
+
+  def self.rarity_sort_key(rarity)
+    idx = RARITY_ORDER.index(rarity.to_s.downcase)
+    idx || RARITY_ORDER.length  # Unknown rarities sort at end
+  end
+
+  def self.quality_sort_key(quality)
+    idx = QUALITY_ORDER.index(quality.to_s.downcase)
+    idx || QUALITY_ORDER.length  # Unknown qualities sort at end
+  end
+
+  def self.stats_for_gem(gem_name = nil)
+    query = Appraisals.where(game: XMLData.game)
+    query = query.where(Sequel.ilike(:gem_name, "%#{gem_name}%")) if gem_name && !gem_name.empty?
+
+    results = query
+      .group(:gem_name)
+      .select {
+        [
+          gem_name,
+          count(value).as(:count),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .order(Sequel.desc(:count))
+      .all
+
+    if results.empty?
+      if gem_name && !gem_name.empty?
+        respond "No appraisals found for gems matching '#{gem_name}'."
+      else
+        respond "No gem appraisals recorded yet. Use APPRAISE on gems to start tracking."
+      end
+      return
+    end
+
+    rows = results.map { |r|
+      [
+        r[:gem_name],
+        r[:count],
+        with_commas(r[:min_value]),
+        with_commas(r[:max_value]),
+        with_commas(r[:avg_value].to_i)
+      ]
+    }
+
+    table = Terminal::Table.new(
+      headings: ['Gem', 'Count', 'Min', 'Max', 'Average'],
+      rows: rows
+    )
+
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+  end
+
+  def self.stats_by_rarity(rarity_filter = nil)
+    query = Appraisals.where(game: XMLData.game)
+    if rarity_filter && !rarity_filter.empty?
+      query = query.where(Sequel.ilike(:rarity, "%#{rarity_filter}%"))
+    end
+
+    results = query
+      .group(:rarity)
+      .select {
+        [
+          rarity,
+          count(value).as(:count),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .all
+
+    if results.empty?
+      respond "No appraisals found#{rarity_filter ? " for rarity '#{rarity_filter}'" : ''}."
+      return
+    end
+
+    # Sort by rarity order
+    results.sort_by! { |r| rarity_sort_key(r[:rarity]) }
+
+    rows = results.map { |r|
+      [
+        r[:rarity] || '(unknown)',
+        r[:count],
+        with_commas(r[:min_value]),
+        with_commas(r[:max_value]),
+        with_commas(r[:avg_value].to_i)
+      ]
+    }
+
+    table = Terminal::Table.new(
+      headings: ['Rarity', 'Count', 'Min', 'Max', 'Average'],
+      rows: rows
+    )
+
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+
+    # If filtering by rarity, also show gems in that rarity
+    if rarity_filter && !rarity_filter.empty?
+      respond ""
+      respond "Gems with '#{rarity_filter}' rarity:"
+      gem_results = query
+        .group(:gem_name)
+        .select {
+          [
+            gem_name,
+            count(value).as(:count),
+            min(value).as(:min_value),
+            max(value).as(:max_value),
+            avg(value).as(:avg_value)
+          ]
+        }
+        .order(Sequel.desc(:avg_value))
+        .all
+
+      gem_rows = gem_results.map { |r|
+        [r[:gem_name], r[:count], with_commas(r[:min_value]), with_commas(r[:max_value]), with_commas(r[:avg_value].to_i)]
+      }
+
+      gem_table = Terminal::Table.new(
+        headings: ['Gem', 'Count', 'Min', 'Max', 'Average'],
+        rows: gem_rows
+      )
+      _respond "<output class=\"mono\"/>\n" + gem_table.to_s + "\n<output class=\"\"/>"
+    end
+  end
+
+  def self.stats_by_quality(quality_filter = nil)
+    query = Appraisals.where(game: XMLData.game)
+    if quality_filter && !quality_filter.empty?
+      query = query.where(Sequel.ilike(:quality, "%#{quality_filter}%"))
+    end
+
+    results = query
+      .group(:quality)
+      .select {
+        [
+          quality,
+          count(value).as(:count),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .all
+
+    if results.empty?
+      respond "No appraisals found#{quality_filter ? " for quality '#{quality_filter}'" : ''}."
+      return
+    end
+
+    # Sort by quality order
+    results.sort_by! { |r| quality_sort_key(r[:quality]) }
+
+    rows = results.map { |r|
+      [
+        r[:quality] || '(unknown)',
+        r[:count],
+        with_commas(r[:min_value]),
+        with_commas(r[:max_value]),
+        with_commas(r[:avg_value].to_i)
+      ]
+    }
+
+    table = Terminal::Table.new(
+      headings: ['Quality', 'Count', 'Min', 'Max', 'Average'],
+      rows: rows
+    )
+
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+
+    # If filtering by quality, also show gems with that quality
+    if quality_filter && !quality_filter.empty?
+      respond ""
+      respond "Gems with '#{quality_filter}' quality:"
+      gem_results = query
+        .group(:gem_name)
+        .select {
+          [
+            gem_name,
+            count(value).as(:count),
+            min(value).as(:min_value),
+            max(value).as(:max_value),
+            avg(value).as(:avg_value)
+          ]
+        }
+        .order(Sequel.desc(:avg_value))
+        .all
+
+      gem_rows = gem_results.map { |r|
+        [r[:gem_name], r[:count], with_commas(r[:min_value]), with_commas(r[:max_value]), with_commas(r[:avg_value].to_i)]
+      }
+
+      gem_table = Terminal::Table.new(
+        headings: ['Gem', 'Count', 'Min', 'Max', 'Average'],
+        rows: gem_rows
+      )
+      _respond "<output class=\"mono\"/>\n" + gem_table.to_s + "\n<output class=\"\"/>"
+    end
+  end
+
+  def self.search_gem(gem_name)
+    return respond("Please provide a gem name to search.") if gem_name.nil? || gem_name.empty?
+
+    query = Appraisals.where(game: XMLData.game)
+      .where(Sequel.ilike(:gem_name, "%#{gem_name}%"))
+
+    results = query.all
+    if results.empty?
+      respond "No appraisals found for gems matching '#{gem_name}'."
+      return
+    end
+
+    # Group by gem name first
+    gems = results.group_by { |r| r[:gem_name] }
+
+    gems.each do |name, appraisals|
+      respond ""
+      respond "=== #{name.upcase} ==="
+      respond "Total appraisals: #{appraisals.count}"
+
+      values = appraisals.map { |a| a[:value] }
+      respond "Value range: #{with_commas(values.min)} - #{with_commas(values.max)} (avg: #{with_commas((values.sum.to_f / values.count).to_i)})"
+
+      # Breakdown by rarity
+      by_rarity = appraisals.group_by { |a| a[:rarity] }
+      if by_rarity.keys.compact.any?
+        respond ""
+        respond "By Rarity:"
+        by_rarity.sort_by { |r, _| rarity_sort_key(r) }.each do |rarity, apps|
+          vals = apps.map { |a| a[:value] }
+          respond "  #{rarity || '(unknown)'}: #{apps.count} (#{with_commas(vals.min)} - #{with_commas(vals.max)}, avg: #{with_commas((vals.sum.to_f / vals.count).to_i)})"
+        end
+      end
+
+      # Breakdown by quality
+      by_quality = appraisals.group_by { |a| a[:quality] }
+      if by_quality.keys.compact.any?
+        respond ""
+        respond "By Quality:"
+        by_quality.sort_by { |q, _| quality_sort_key(q) }.each do |quality, apps|
+          vals = apps.map { |a| a[:value] }
+          respond "  #{quality || '(unknown)'}: #{apps.count} (#{with_commas(vals.min)} - #{with_commas(vals.max)}, avg: #{with_commas((vals.sum.to_f / vals.count).to_i)})"
+        end
+      end
+    end
+  end
+
+  # sort_mode: :alpha (default), :value_asc, :value_desc
+  # export: if truthy, export to CSV instead of displaying (can be filename or true for default)
+  def self.matrix_view(gem_filter = nil, sort_mode: :alpha, export: nil)
+    query = Appraisals.where(game: XMLData.game)
+    if gem_filter && !gem_filter.empty?
+      query = query.where(Sequel.ilike(:gem_name, "%#{gem_filter}%"))
+    end
+
+    results = query.all
+    if results.empty?
+      respond "No appraisals found#{gem_filter ? " for gems matching '#{gem_filter}'" : ''}."
+      return
+    end
+
+    # Get all unique qualities found in the data, sorted by known order
+    all_qualities = results.map { |r| r[:quality] }.compact.uniq
+    all_qualities.sort_by! { |q| quality_sort_key(q) }
+
+    # Group by gem name
+    gems = results.group_by { |r| r[:gem_name] }
+
+    # Calculate average value for each gem (for sorting)
+    gem_avg_values = {}
+    gems.each do |gem_name, appraisals|
+      values = appraisals.map { |a| a[:value] }
+      gem_avg_values[gem_name] = values.sum.to_f / values.count
+    end
+
+    # Sort gem names based on sort_mode
+    sorted_gem_names = case sort_mode
+    when :value_asc
+      gems.keys.sort_by { |name| gem_avg_values[name] }
+    when :value_desc
+      gems.keys.sort_by { |name| -gem_avg_values[name] }
+    else
+      gems.keys.sort
+    end
+
+    # Build rows: gem_name, rarity, avg_value, then value range for each quality
+    rows = []
+    sorted_gem_names.each do |gem_name|
+      appraisals = gems[gem_name]
+
+      # Get the most common rarity for this gem (should be consistent)
+      rarity = appraisals.map { |a| a[:rarity] }.compact
+        .group_by(&:itself)
+        .max_by { |_, v| v.size }&.first || '-'
+
+      avg_value = gem_avg_values[gem_name].to_i
+      row = [gem_name, rarity, avg_value]
+
+      # For each quality column, show value range
+      all_qualities.each do |quality|
+        matching = appraisals.select { |a| a[:quality] == quality }
+        if matching.empty?
+          row << '-'
+        else
+          values = matching.map { |a| a[:value] }
+          if values.min == values.max
+            row << (export ? values.min : with_commas(values.min))
+          else
+            row << (export ? "#{values.min}-#{values.max}" : "#{with_commas(values.min)}-#{with_commas(values.max)}")
+          end
+        end
+      end
+
+      rows << row
+    end
+
+    # Handle export mode
+    if export
+      filename = export.is_a?(String) && !export.empty? ? export : "gemtracker_matrix_#{Time.now.strftime('%Y%m%d_%H%M%S')}.csv"
+      filename += '.csv' unless filename.end_with?('.csv')
+      filepath = File.join($lich_dir, filename)
+
+      begin
+        File.open(filepath, 'w') do |f|
+          # Full quality names for CSV headers
+          csv_headers = ['gem_name', 'rarity', 'avg_value'] + all_qualities
+          f.puts csv_headers.map { |h| "\"#{h}\"" }.join(',')
+          rows.each do |row|
+            # Format: quoted strings, raw numbers for avg_value
+            csv_row = row.map.with_index do |cell, i|
+              if i == 2 # avg_value column - raw number
+                cell
+              else
+                "\"#{cell}\""
+              end
+            end
+            f.puts csv_row.join(',')
+          end
+        end
+        respond "Exported matrix (#{rows.count} gems x #{all_qualities.count} qualities) to: #{filepath}"
+      rescue => e
+        respond "Export failed: #{e.message}"
+      end
+      return
+    end
+
+    # Display mode - format avg_value with commas for display
+    display_rows = rows.map do |row|
+      row.dup.tap { |r| r[2] = with_commas(r[2]) }
+    end
+
+    # Truncate quality names for column headers if needed
+    headers = ['Gem', 'Rarity', 'Avg Value'] + all_qualities.map { |q|
+      # Abbreviate long quality names
+      case q
+      when 'extremely common' then 'ext com'
+      when 'very common' then 'v com'
+      when 'below average' then 'below avg'
+      when 'above average' then 'above avg'
+      when 'very poor' then 'v poor'
+      when 'very good' then 'v good'
+      when 'very cheap' then 'v cheap'
+      else q
+      end
+    }
+
+    table = Terminal::Table.new(
+      headings: headers,
+      rows: display_rows
+    )
+
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+
+    respond ""
+    respond "Legend: Values show min-max range for each gem/quality combination."
+    respond "Columns are quality levels, sorted from lowest to highest."
+  end
+
+  # List gem names by value threshold
+  # mode: :gte (>=) or :lte (<=)
+  def self.list_by_value(threshold, mode: :gte)
+    results = Appraisals.where(game: XMLData.game).all
+    if results.empty?
+      respond "No appraisals found."
+      return
+    end
+
+    # Group by gem name and calculate averages
+    gems = results.group_by { |r| r[:gem_name] }
+    gem_avg_values = {}
+    gems.each do |gem_name, appraisals|
+      values = appraisals.map { |a| a[:value] }
+      gem_avg_values[gem_name] = values.sum.to_f / values.count
+    end
+
+    # Filter by threshold
+    filtered = gem_avg_values.select do |_name, avg|
+      mode == :gte ? avg >= threshold : avg <= threshold
+    end
+
+    if filtered.empty?
+      op = mode == :gte ? ">=" : "<="
+      respond "No gems found with average value #{op} #{with_commas(threshold)}."
+      return
+    end
+
+    # Sort by value (asc for gte, desc for lte)
+    sorted = if mode == :gte
+      filtered.sort_by { |_name, avg| avg }
+    else
+      filtered.sort_by { |_name, avg| -avg }
+    end
+
+    # Build array of names
+    gem_names = sorted.map { |name, _avg| name }
+
+    # Echo as array
+    op = mode == :gte ? ">=" : "<="
+    echo "Gems with avg value #{op} #{with_commas(threshold)} (#{gem_names.count} found):"
+    echo gem_names.inspect
+  end
+
+  def self.stats_by_character(char_name = nil)
+    query = Appraisals.where(game: XMLData.game)
+    if char_name && !char_name.empty?
+      query = query.where(Sequel.ilike(:character, "%#{char_name}%"))
+    end
+
+    results = query
+      .group(:character)
+      .select {
+        [
+          character,
+          count(value).as(:count),
+          sum(value).as(:total_value),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .order(Sequel.desc(:total_value))
+      .all
+
+    if results.empty?
+      respond "No appraisals found#{char_name ? " for character '#{char_name}'" : ''}."
+      return
+    end
+
+    rows = results.map { |r|
+      [
+        r[:character],
+        r[:count],
+        with_commas(r[:total_value]),
+        with_commas(r[:min_value]),
+        with_commas(r[:max_value]),
+        with_commas(r[:avg_value].to_i)
+      ]
+    }
+
+    table = Terminal::Table.new(
+      headings: ['Character', 'Count', 'Total Value', 'Min', 'Max', 'Average'],
+      rows: rows
+    )
+
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+  end
+
+  def self.recent(limit = 20)
+    results = Appraisals
+      .where(game: XMLData.game)
+      .order(Sequel.desc(:created_at))
+      .limit(limit)
+      .all
+
+    if results.empty?
+      respond "No recent appraisals found."
+      return
+    end
+
+    rows = results.map { |r|
+      [
+        r[:gem_name],
+        r[:rarity] || '-',
+        r[:quality] || '-',
+        with_commas(r[:value]),
+        r[:character],
+        r[:created_at].strftime("%m-%d %H:%M")
+      ]
+    }
+
+    table = Terminal::Table.new(
+      headings: ['Gem', 'Rarity', 'Quality', 'Value', 'Char', 'Time'],
+      rows: rows
+    )
+
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+  end
+
+  def self.export_csv(filename = nil)
+    filename ||= "gemtracker_export_#{Time.now.strftime('%Y%m%d_%H%M%S')}.csv"
+    filepath = File.join($lich_dir, filename)
+
+    results = Appraisals.where(game: XMLData.game).order(:gem_name, :created_at).all
+
+    if results.empty?
+      respond "No data to export."
+      return
+    end
+
+    begin
+      File.open(filepath, 'w') do |f|
+        f.puts "gem_name,rarity,quality,value,character,date"
+        results.each do |r|
+          f.puts [
+            "\"#{r[:gem_name]}\"",
+            "\"#{r[:rarity]}\"",
+            "\"#{r[:quality]}\"",
+            r[:value],
+            "\"#{r[:character]}\"",
+            "\"#{r[:created_at].strftime('%Y-%m-%d %H:%M:%S')}\""
+          ].join(',')
+        end
+      end
+      respond "Exported #{results.count} records to: #{filepath}"
+    rescue => e
+      respond "Export failed: #{e.message}"
+    end
+  end
+
+  def self.purify_stats(gem_filter = nil)
+    query = Appraisals.where(game: XMLData.game)
+    if gem_filter && !gem_filter.empty?
+      query = query.where(Sequel.ilike(:gem_name, "%#{gem_filter}%"))
+    end
+
+    # Get raw stats (purified = false or NULL)
+    raw_results = query
+      .where(Sequel.lit('purified IS NULL OR purified = ?', false))
+      .group(:gem_name)
+      .select {
+        [
+          gem_name,
+          count(value).as(:count),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .all
+      .map { |r| [r[:gem_name], r] }
+      .to_h
+
+    # Get purified stats
+    purified_results = query
+      .where(purified: true)
+      .group(:gem_name)
+      .select {
+        [
+          gem_name,
+          count(value).as(:count),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .all
+      .map { |r| [r[:gem_name], r] }
+      .to_h
+
+    if raw_results.empty? && purified_results.empty?
+      respond "No appraisals found#{gem_filter ? " for '#{gem_filter}'" : ''}."
+      return
+    end
+
+    if purified_results.empty?
+      respond "No purified gem data yet. Run ;purify with GemTracker active to collect data."
+      return
+    end
+
+    # Build comparison table for gems with both raw and purified data
+    all_gems = (raw_results.keys + purified_results.keys).uniq.sort
+    rows = []
+
+    all_gems.each do |gem_name|
+      raw = raw_results[gem_name]
+      pur = purified_results[gem_name]
+
+      next unless raw && pur # Need both for comparison
+
+      raw_avg = raw[:avg_value].to_i
+      pur_avg = pur[:avg_value].to_i
+      gain = pur_avg - raw_avg
+      gain_pct = raw_avg > 0 ? ((gain.to_f / raw_avg) * 100).round(1) : 0
+
+      rows << [
+        gem_name,
+        raw[:count],
+        "#{with_commas(raw[:min_value])}-#{with_commas(raw[:max_value])}",
+        with_commas(raw_avg),
+        pur[:count],
+        "#{with_commas(pur[:min_value])}-#{with_commas(pur[:max_value])}",
+        with_commas(pur_avg),
+        "+#{with_commas(gain)} (+#{gain_pct}%)"
+      ]
+    end
+
+    if rows.empty?
+      respond "No gems found with both raw and purified data#{gem_filter ? " matching '#{gem_filter}'" : ''}."
+      respond "Keep running ;purify with GemTracker to collect comparison data."
+      return
+    end
+
+    # Sort by gain percentage descending
+    rows.sort_by! { |r| -r[7].scan(/\d+\.\d+/).first.to_f }
+
+    table = Terminal::Table.new(
+      headings: ['Gem', 'Raw#', 'Raw Range', 'Raw Avg', 'Pur#', 'Pur Range', 'Pur Avg', 'Gain'],
+      rows: rows
+    )
+
+    respond ""
+    respond "Raw vs Purified Gem Value Comparison"
+    respond "====================================="
+    _respond "<output class=\"mono\"/>\n" + table.to_s + "\n<output class=\"\"/>"
+
+    # Summary stats
+    total_raw = rows.sum { |r| r[3].delete(',').to_i * r[1] }
+    total_pur = rows.sum { |r| r[6].delete(',').to_i * r[4] }
+    respond ""
+    respond "Summary: Purification provides ~#{((rows.sum { |r| r[7].scan(/\d+\.\d+/).first.to_f } / rows.size)).round(1)}% avg value increase"
+  end
+
+  def self.clear_data
+    count = Appraisals.where(game: XMLData.game).count
+    if count == 0
+      respond "No data to clear."
+      return
+    end
+
+    respond "This will delete #{count} appraisal records for #{XMLData.game}."
+    respond "Type ;send YES to confirm, or anything else to cancel."
+
+    line = get until line =~ /^;?(?:send\s+)?(.+)$/i
+    if $1.strip.upcase == "YES"
+      Appraisals.where(game: XMLData.game).delete
+      respond "Cleared #{count} appraisal records."
+    else
+      respond "Clear cancelled."
+    end
+  end
+
+  def self.help
+    respond ""
+    respond "GemTracker v1.3 - Gem Appraisal Value Tracker"
+    respond "=============================================="
+    respond ""
+    respond "Tracking Commands:"
+    respond "  ;gemtracker              - Start tracking in background"
+    respond ""
+    respond "Statistics Commands:"
+    respond "  ;gemtracker stats        - Show min/max/avg for all gems"
+    respond "  ;gemtracker stats <gem>  - Filter stats by gem name"
+    respond "  ;gemtracker rarity       - Show stats grouped by rarity"
+    respond "  ;gemtracker rarity <lvl> - Show gems of specific rarity"
+    respond "  ;gemtracker quality      - Show stats grouped by quality"
+    respond "  ;gemtracker quality <q>  - Show gems of specific quality"
+    respond "  ;gemtracker search <gem> - Detailed breakdown for a gem"
+    respond "  ;gemtracker matrix       - Quality vs value matrix (alphabetical)"
+    respond "  ;gemtracker matrix <gem> - Matrix filtered by gem name"
+    respond "  ;gemtracker matrix -v    - Matrix sorted by avg value (low to high)"
+    respond "  ;gemtracker matrix -vd   - Matrix sorted by avg value (high to low)"
+    respond "  ;gemtracker matrix -export         - Export matrix to CSV"
+    respond "  ;gemtracker matrix -vd -export     - Combine sort and export"
+    respond "  ;gemtracker matrix -export myfile  - Export with custom filename"
+    respond "  ;gemtracker list -v N    - List gem names with avg value >= N"
+    respond "  ;gemtracker list -vd N   - List gem names with avg value <= N"
+    respond "  ;gemtracker char         - Show stats by character"
+    respond "  ;gemtracker char <name>  - Filter by character name"
+    respond "  ;gemtracker purify       - Compare raw vs purified gem values"
+    respond "  ;gemtracker purify <gem> - Filter comparison by gem name"
+    respond ""
+    respond "Other Commands:"
+    respond "  ;gemtracker recent [n]   - Show last n appraisals (default 20)"
+    respond "  ;gemtracker export [f]   - Export to CSV file"
+    respond "  ;gemtracker clear        - Clear all data (with confirmation)"
+    respond "  ;gemtracker help         - Show this help"
+    respond ""
+    respond "Google Sheets Commands:"
+    respond "  ;gemtracker sheets keyfile <path>   - Set service account JSON key"
+    respond "  ;gemtracker sheets spreadsheet <id> - Set spreadsheet ID/URL"
+    respond "  ;gemtracker sheets push             - Push all data to Google Sheets"
+    respond "  ;gemtracker sheets                  - Show sheets help for more"
+    respond ""
+    respond "The tracker captures APPRAISE output and stores gem name, rarity,"
+    respond "quality, and value. Purified gems are flagged when appraised via ;purify."
+    respond ""
+  end
+
+  def self.main
+    loop do
+      line = get
+      if match = line.match(APPRAISAL_REGEX)
+        gem_name = match[:gem]
+        rarity = match[:rarity]
+        quality = match[:quality]
+        value = match[:value].delete(',').to_i
+        record_appraisal(gem_name, rarity, quality, value)
+      end
+    end
+  end
+end
+
+# Google Sheets integration module (Service Account API)
+module GoogleSheets
+  SCOPES = ['https://www.googleapis.com/auth/spreadsheets'].freeze
+
+  class GoogleSheetsError < StandardError; end
+  class AuthenticationError < GoogleSheetsError; end
+  class SpreadsheetNotFoundError < GoogleSheetsError; end
+  class PermissionError < GoogleSheetsError; end
+
+  def self.available?
+    GOOGLE_SHEETS_AVAILABLE
+  end
+
+  def self.configured?
+    available? && keyfile_path && spreadsheet_id && File.exist?(keyfile_path.to_s)
+  end
+
+  def self.keyfile_path
+    UserVars.gemtracker_sheets_keyfile
+  end
+
+  def self.keyfile_path=(path)
+    UserVars.gemtracker_sheets_keyfile = path
+  end
+
+  def self.spreadsheet_id
+    UserVars.gemtracker_sheets_id
+  end
+
+  def self.spreadsheet_id=(id)
+    UserVars.gemtracker_sheets_id = id
+  end
+
+  def self.last_push
+    UserVars.gemtracker_sheets_last_push
+  end
+
+  def self.last_push=(time)
+    UserVars.gemtracker_sheets_last_push = time
+  end
+
+  def self.service
+    return nil unless available?
+    @service ||= begin
+      # Suppress Google API client logging (it tries to log to nil path otherwise)
+      # File::NULL is 'NUL' on Windows, '/dev/null' on Unix
+      Google::Apis.logger = Logger.new(File::NULL)
+
+      svc = Google::Apis::SheetsV4::SheetsService.new
+      svc.authorization = Google::Auth::ServiceAccountCredentials.make_creds(
+        json_key_io: File.open(keyfile_path),
+        scope: SCOPES
+      )
+      svc
+    end
+  end
+
+  def self.reset_service!
+    @service = nil
+  end
+
+  # Extract spreadsheet ID from URL or return as-is if already an ID
+  def self.extract_spreadsheet_id(input)
+    if input =~ %r{/spreadsheets/d/([a-zA-Z0-9_-]+)}
+      $1
+    else
+      input
+    end
+  end
+
+  # Test connection and return spreadsheet title
+  def self.test_connection
+    result = service.get_spreadsheet(spreadsheet_id, fields: 'properties.title')
+    result.properties.title
+  rescue Google::Apis::AuthorizationError => e
+    raise AuthenticationError, "Invalid credentials: #{e.message}"
+  rescue Google::Apis::ClientError => e
+    if e.message.include?('not found')
+      raise SpreadsheetNotFoundError, "Spreadsheet not found. Check the ID or URL."
+    elsif e.message.include?('permission') || e.message.include?('forbidden')
+      raise PermissionError, "Permission denied. Share the spreadsheet with the service account email."
+    else
+      raise GoogleSheetsError, e.message
+    end
+  end
+
+  # Ensure required sheets exist, create if missing
+  def self.ensure_sheets_exist
+    spreadsheet = service.get_spreadsheet(spreadsheet_id)
+    existing = spreadsheet.sheets.map { |s| s.properties.title }
+
+    %w[Matrix Appraisals Stats].each do |sheet_name|
+      unless existing.include?(sheet_name)
+        request = Google::Apis::SheetsV4::BatchUpdateSpreadsheetRequest.new(
+          requests: [{
+            add_sheet: {
+              properties: { title: sheet_name }
+            }
+          }]
+        )
+        service.batch_update_spreadsheet(spreadsheet_id, request)
+        respond "Created sheet: #{sheet_name}"
+      end
+    end
+  end
+
+  # Clear and write data to a sheet
+  def self.write_sheet(sheet_name, data)
+    range = "#{sheet_name}!A1"
+    # Clear existing data
+    service.clear_values(spreadsheet_id, "#{sheet_name}!A:ZZ")
+    # Write new data
+    value_range = Google::Apis::SheetsV4::ValueRange.new(values: data)
+    service.update_spreadsheet_value(
+      spreadsheet_id,
+      range,
+      value_range,
+      value_input_option: 'RAW'
+    )
+  end
+
+  # Data transformation: Matrix view
+  def self.matrix_data
+    query = GemTracker::Appraisals.where(game: XMLData.game)
+    results = query.all
+    return nil if results.empty?
+
+    all_qualities = results.map { |r| r[:quality] }.compact.uniq
+    all_qualities.sort_by! { |q| GemTracker.quality_sort_key(q) }
+
+    gems = results.group_by { |r| r[:gem_name] }
+    gem_avg_values = {}
+    gems.each do |gem_name, appraisals|
+      values = appraisals.map { |a| a[:value] }
+      gem_avg_values[gem_name] = values.sum.to_f / values.count
+    end
+
+    sorted_gem_names = gems.keys.sort_by { |name| -gem_avg_values[name] }
+
+    headers = ['Gem Name', 'Rarity', 'Avg Value'] + all_qualities
+    rows = [headers]
+
+    sorted_gem_names.each do |gem_name|
+      appraisals = gems[gem_name]
+      rarity = appraisals.map { |a| a[:rarity] }.compact
+        .group_by(&:itself)
+        .max_by { |_, v| v.size }&.first || ''
+
+      avg_value = gem_avg_values[gem_name].to_i
+      row = [gem_name, rarity, avg_value]
+
+      all_qualities.each do |quality|
+        matching = appraisals.select { |a| a[:quality] == quality }
+        if matching.empty?
+          row << ''
+        else
+          values = matching.map { |a| a[:value] }
+          row << (values.min == values.max ? values.min : "#{values.min}-#{values.max}")
+        end
+      end
+
+      rows << row
+    end
+
+    rows
+  end
+
+  # Data transformation: Raw appraisals
+  def self.raw_appraisals_data
+    headers = ['Gem Name', 'Rarity', 'Quality', 'Value', 'Character', 'Date', 'Purified']
+    rows = [headers]
+
+    GemTracker::Appraisals.where(game: XMLData.game).order(:created_at).each do |r|
+      rows << [
+        r[:gem_name],
+        r[:rarity],
+        r[:quality],
+        r[:value],
+        r[:character],
+        r[:created_at].to_s,
+        r[:purified] ? 'Yes' : 'No'
+      ]
+    end
+
+    rows
+  end
+
+  # Data transformation: Summary stats
+  def self.summary_stats_data
+    headers = ['Gem Name', 'Count', 'Min Value', 'Max Value', 'Avg Value']
+    rows = [headers]
+
+    results = GemTracker::Appraisals.where(game: XMLData.game)
+      .group(:gem_name)
+      .select {
+        [
+          gem_name,
+          count(value).as(:count),
+          min(value).as(:min_value),
+          max(value).as(:max_value),
+          avg(value).as(:avg_value)
+        ]
+      }
+      .order(Sequel.desc(:avg_value))
+      .all
+
+    results.each do |r|
+      rows << [
+        r[:gem_name],
+        r[:count],
+        r[:min_value],
+        r[:max_value],
+        r[:avg_value].to_i
+      ]
+    end
+
+    rows
+  end
+
+  # Set keyfile path (command-based, no interactive prompts)
+  def self.set_keyfile(path)
+    unless available?
+      respond "Google Sheets API gem not installed."
+      respond "Install with: gem install google-apis-sheets_v4"
+      return
+    end
+
+    if path.nil? || path.empty?
+      respond "Usage: ;gemtracker sheets keyfile <path_to_json_file>"
+      respond ""
+      respond "Example: ;gemtracker sheets keyfile C:/path/to/service-account.json"
+      return
+    end
+
+    # Clean up path - remove quotes if present
+    path = path.gsub(/^["']|["']$/, '').strip
+
+    unless File.exist?(path)
+      respond "File not found: #{path}"
+      respond ""
+      respond "Make sure the path exists and is accessible."
+      return
+    end
+
+    # Validate it's a JSON file
+    begin
+      content = File.read(path)
+      json = JSON.parse(content)
+      unless json['type'] == 'service_account' && json['client_email']
+        respond "Error: File does not appear to be a service account key."
+        respond "Expected 'type': 'service_account' in the JSON."
+        return
+      end
+      email = json['client_email']
+    rescue JSON::ParserError => e
+      respond "Error: Invalid JSON file: #{e.message}"
+      return
+    end
+
+    self.keyfile_path = path
+    reset_service!
+
+    respond "Keyfile set: #{path}"
+    respond ""
+    respond "Service account email: #{email}"
+    respond "Share your spreadsheet with this email address (Editor access)."
+    respond ""
+    if spreadsheet_id
+      respond "Spreadsheet already configured. Testing connection..."
+      test_and_report
+    else
+      respond "Next: ;gemtracker sheets spreadsheet <spreadsheet_url_or_id>"
+    end
+  end
+
+  # Set spreadsheet ID (command-based)
+  def self.set_spreadsheet(input)
+    unless available?
+      respond "Google Sheets API gem not installed."
+      respond "Install with: gem install google-apis-sheets_v4"
+      return
+    end
+
+    if input.nil? || input.empty?
+      respond "Usage: ;gemtracker sheets spreadsheet <url_or_id>"
+      respond ""
+      respond "Examples:"
+      respond "  ;gemtracker sheets spreadsheet 1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+      respond "  ;gemtracker sheets spreadsheet https://docs.google.com/spreadsheets/d/1BxiMVs.../edit"
+      return
+    end
+
+    # Clean up input - remove quotes if present
+    input = input.gsub(/^["']|["']$/, '').strip
+    self.spreadsheet_id = extract_spreadsheet_id(input)
+
+    respond "Spreadsheet ID set: #{spreadsheet_id}"
+    respond ""
+
+    if keyfile_path && File.exist?(keyfile_path)
+      respond "Testing connection..."
+      test_and_report
+    else
+      respond "Next: ;gemtracker sheets keyfile <path_to_json_file>"
+    end
+  end
+
+  # Test connection and report results
+  def self.test_and_report
+    unless available?
+      respond "Google Sheets API gem not installed."
+      respond "Install with: gem install google-apis-sheets_v4"
+      return
+    end
+
+    unless configured?
+      respond "Google Sheets not fully configured."
+      respond "Need: ;gemtracker sheets keyfile <path>" unless keyfile_path && File.exist?(keyfile_path)
+      respond "Need: ;gemtracker sheets spreadsheet <id>" unless spreadsheet_id
+      return
+    end
+
+    begin
+      title = test_connection
+      respond "Connected to spreadsheet: #{title}"
+      ensure_sheets_exist
+      respond ""
+      respond "Setup complete! Use ';gemtracker sheets push' to upload data."
+    rescue GoogleSheetsError => e
+      respond "Connection failed: #{e.message}"
+      respond ""
+      respond "Common issues:"
+      respond "- Spreadsheet not shared with service account email"
+      respond "- Invalid spreadsheet ID"
+      respond "- Service account key expired or revoked"
+    end
+  end
+
+  # Push data to sheets
+  def self.push(type = 'all')
+    unless available?
+      respond "Google Sheets API gem not installed."
+      respond "Install with: gem install google-apis-sheets_v4"
+      return
+    end
+
+    unless configured?
+      respond "Google Sheets not configured. Run ';gemtracker sheets setup' first."
+      return
+    end
+
+    type = type.to_s.downcase
+    valid_types = %w[all matrix raw stats]
+    unless valid_types.include?(type)
+      respond "Invalid type: #{type}"
+      respond "Valid types: #{valid_types.join(', ')}"
+      return
+    end
+
+    begin
+      pushed = []
+
+      if type == 'all' || type == 'matrix'
+        data = matrix_data
+        if data && data.length > 1
+          write_sheet('Matrix', data)
+          pushed << "Matrix (#{data.length - 1} gems)"
+        else
+          respond "No matrix data to push."
+        end
+      end
+
+      if type == 'all' || type == 'raw'
+        data = raw_appraisals_data
+        if data && data.length > 1
+          write_sheet('Appraisals', data)
+          pushed << "Appraisals (#{data.length - 1} records)"
+        else
+          respond "No appraisal data to push."
+        end
+      end
+
+      if type == 'all' || type == 'stats'
+        data = summary_stats_data
+        if data && data.length > 1
+          write_sheet('Stats', data)
+          pushed << "Stats (#{data.length - 1} gems)"
+        else
+          respond "No stats data to push."
+        end
+      end
+
+      if pushed.any?
+        self.last_push = Time.now.to_s
+        respond ""
+        respond "Pushed to Google Sheets:"
+        pushed.each { |p| respond "  - #{p}" }
+        respond "Timestamp: #{last_push}"
+      end
+
+    rescue GoogleSheetsError => e
+      respond "Push failed: #{e.message}"
+    rescue => e
+      respond "Unexpected error: #{e.message}"
+    end
+  end
+
+  # Show current configuration status
+  def self.show_status
+    respond ""
+    respond "=== Google Sheets Status ==="
+    respond ""
+    respond "API Available: #{available? ? 'Yes' : 'No (gem not installed)'}"
+
+    if available?
+      respond "Keyfile: #{keyfile_path || '(not set)'}"
+      if keyfile_path
+        respond "  Exists: #{File.exist?(keyfile_path) ? 'Yes' : 'No'}"
+      end
+      respond "Spreadsheet ID: #{spreadsheet_id || '(not set)'}"
+      respond "Last Push: #{last_push || '(never)'}"
+      respond ""
+      respond "Configured: #{configured? ? 'Yes' : 'No'}"
+
+      if configured?
+        begin
+          title = test_connection
+          respond "Connection: OK (#{title})"
+        rescue GoogleSheetsError => e
+          respond "Connection: FAILED (#{e.message})"
+        end
+      end
+    end
+    respond ""
+  end
+
+  def self.help
+    respond ""
+    respond "Google Sheets Commands:"
+    respond "========================"
+    respond ""
+    respond "Setup Commands:"
+    respond "  ;gemtracker sheets keyfile <path>     - Set service account JSON key file"
+    respond "  ;gemtracker sheets spreadsheet <id>   - Set spreadsheet (ID or full URL)"
+    respond "  ;gemtracker sheets status             - Show current configuration"
+    respond "  ;gemtracker sheets test               - Test the connection"
+    respond "  ;gemtracker sheets clear              - Clear all configuration"
+    respond ""
+    respond "Push Commands:"
+    respond "  ;gemtracker sheets push               - Push all data (matrix + raw + stats)"
+    respond "  ;gemtracker sheets push matrix        - Push matrix view only"
+    respond "  ;gemtracker sheets push raw           - Push all appraisals only"
+    respond "  ;gemtracker sheets push stats         - Push summary stats only"
+    respond ""
+    respond "Setup Requirements:"
+    respond "  1. Go to https://console.cloud.google.com/"
+    respond "  2. Create a project (or select existing)"
+    respond "  3. Enable 'Google Sheets API'"
+    respond "  4. Go to Credentials > Create Credentials > Service Account"
+    respond "  5. Download the JSON key file, save somewhere permanent"
+    respond "  6. Create a Google Spreadsheet"
+    respond "  7. Share the spreadsheet with the service account email (Editor)"
+    respond "  8. Run the setup commands:"
+    respond "     ;gemtracker sheets keyfile C:/path/to/your-key.json"
+    respond "     ;gemtracker sheets spreadsheet <your_spreadsheet_id>"
+    respond ""
+  end
+
+  def self.clear_config
+    self.keyfile_path = nil
+    self.spreadsheet_id = nil
+    reset_service!
+    respond "Google Sheets configuration cleared."
+  end
+end
+
+# Handle command-line arguments
+args = Script.current.vars[1..-1] || []
+command = args[0]&.downcase
+arg = args[1..-1]&.join(' ')
+
+case command
+when 'help', '-h', '--help'
+  GemTracker.help
+when 'stats'
+  GemTracker.stats_for_gem(arg)
+when 'rarity'
+  GemTracker.stats_by_rarity(arg)
+when 'quality'
+  GemTracker.stats_by_quality(arg)
+when 'search'
+  GemTracker.search_gem(arg)
+when 'matrix'
+  # Parse flags: -v (value asc), -vd (value desc), -export [filename]
+  sort_mode = :alpha
+  export = nil
+  gem_filter = arg
+  if arg
+    # Check for -export flag (can appear anywhere in args)
+    if arg.include?('-export')
+      export = true
+      # Extract optional filename after -export
+      if arg =~ /-export\s+(\S+)/
+        export = $1 unless $1.start_with?('-')
+      end
+      gem_filter = arg.gsub(/-export(?:\s+\S+)?/, '').strip
+    end
+    # Check for sort flags
+    if gem_filter&.include?('-vd')
+      sort_mode = :value_desc
+      gem_filter = gem_filter.gsub('-vd', '').strip
+    elsif gem_filter&.include?('-v')
+      sort_mode = :value_asc
+      gem_filter = gem_filter.gsub('-v', '').strip
+    end
+    gem_filter = nil if gem_filter&.empty?
+  end
+  GemTracker.matrix_view(gem_filter, sort_mode: sort_mode, export: export)
+when 'list'
+  # Parse: -v <threshold> (>=) or -vd <threshold> (<=)
+  if arg.nil? || arg.empty?
+    echo "Usage: ;gemtracker list -v <value> OR ;gemtracker list -vd <value>"
+  elsif arg.start_with?('-vd')
+    threshold = arg.sub(/^-vd\s*/, '').strip.delete(',').to_i
+    if threshold <= 0
+      echo "Please provide a valid threshold value."
+    else
+      GemTracker.list_by_value(threshold, mode: :lte)
+    end
+  elsif arg.start_with?('-v')
+    threshold = arg.sub(/^-v\s*/, '').strip.delete(',').to_i
+    if threshold <= 0
+      echo "Please provide a valid threshold value."
+    else
+      GemTracker.list_by_value(threshold, mode: :gte)
+    end
+  else
+    echo "Usage: ;gemtracker list -v <value> OR ;gemtracker list -vd <value>"
+  end
+when 'char', 'character'
+  GemTracker.stats_by_character(arg)
+when 'purify', 'purified'
+  GemTracker.purify_stats(arg)
+when 'sheets', 'google'
+  subcommand = args[1]&.downcase
+  # For keyfile and spreadsheet commands, join remaining args to handle paths with spaces
+  remaining_args = args[2..-1]&.join(' ')
+  case subcommand
+  when 'keyfile', 'key'
+    GoogleSheets.set_keyfile(remaining_args)
+  when 'spreadsheet', 'sheet', 'id'
+    GoogleSheets.set_spreadsheet(remaining_args)
+  when 'push'
+    type = args[2]&.downcase || 'all'
+    GoogleSheets.push(type)
+  when 'status'
+    GoogleSheets.show_status
+  when 'test'
+    GoogleSheets.test_and_report
+  when 'clear'
+    GoogleSheets.clear_config
+  else
+    GoogleSheets.help
+  end
+when 'recent'
+  limit = arg&.to_i
+  limit = 20 if limit.nil? || limit <= 0
+  GemTracker.recent(limit)
+when 'export'
+  GemTracker.export_csv(arg&.empty? ? nil : arg)
+when 'clear'
+  GemTracker.clear_data
+when nil, ''
+  echo "GemTracker v1.3 started. Monitoring for gem appraisals..."
+  echo "Type ;gemtracker help for commands."
+  GemTracker.main
+else
+  echo "Unknown command: #{command}"
+  GemTracker.help
+end
