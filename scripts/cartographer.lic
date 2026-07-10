@@ -23,9 +23,12 @@
 
   author: Ondreian
   contributors: Claude Code, Nisugi
-  version: 1.4.0
+  version: 1.5.0
 
   changelog:
+    v1.5.0 - room deletions: rooms present in the baseline but absent from
+             memory can be submitted for removal by naming them in --rooms
+             (never included by --all); deletes room.json plus its proc files
     v1.4.0 - add --source: override which repo releases are downloaded from
              (persisted), enabling a full edit->submit->merge->release->
              download rehearsal against a fork
@@ -51,7 +54,7 @@ require 'json'
 require 'fileutils'
 
 class CartographerManager
-  VERSION = "1.4.0"
+  VERSION = "1.5.0"
   DEFAULT_MAPDB_REPO = "elanthia-online/mapdb"
 
   def initialize
@@ -538,7 +541,7 @@ class CartographerManager
 
   def github_request(method, path, token, body = nil)
     uri = URI("https://api.github.com#{path}")
-    request = { get: Net::HTTP::Get, post: Net::HTTP::Post, put: Net::HTTP::Put }.fetch(method).new(uri)
+    request = { get: Net::HTTP::Get, post: Net::HTTP::Post, put: Net::HTTP::Put, delete: Net::HTTP::Delete }.fetch(method).new(uri)
     request['User-Agent'] = "Lich-Cartographer/#{VERSION}"
     request['Accept'] = 'application/vnd.github+json'
     request['Authorization'] = "Bearer #{token}"
@@ -568,13 +571,16 @@ class CartographerManager
     return unless diff
 
     candidates = diff[:changed].map(&:first) + diff[:added]
-    if candidates.empty?
+    if candidates.empty? && diff[:removed].empty?
       echo "Nothing to submit - in-memory map matches baseline v#{diff[:version]}"
       return
     end
 
-    rooms = select_rooms(candidates, args)
-    return unless rooms
+    selection = select_rooms(candidates, diff[:removed], args)
+    return unless selection
+
+    rooms = selection[:rooms]
+    deletions = selection[:deletions]
 
     dry_run = args.include?('--dry-run')
     # Safe by default: PRs open on YOUR fork unless you explicitly pass
@@ -586,7 +592,10 @@ class CartographerManager
 
     new_ids = diff[:added].map { |r| r['id'] }
     title_type = rooms.any? { |r| new_ids.include?(r['id']) } ? 'feat' : 'fix'
-    title = "#{title_type}(rooms): update #{rooms.length == 1 ? "room #{rooms.first['id']}" : "#{rooms.length} rooms"} via cartographer"
+    described = []
+    described << "update #{rooms.length == 1 ? "room #{rooms.first['id']}" : "#{rooms.length} rooms"}" unless rooms.empty?
+    described << "delete #{deletions.length == 1 ? "room #{deletions.first}" : "#{deletions.length} rooms"}" unless deletions.empty?
+    title = "#{title_type}(rooms): #{described.join(', ')} via cartographer"
 
     body_lines = []
     body_lines << message if message
@@ -595,35 +604,42 @@ class CartographerManager
     body_lines << ""
     diff[:changed].each { |room, fields| body_lines << "- ##{room['id']}: #{fields.join(', ')}" if rooms.include?(room) }
     diff[:added].each { |room| body_lines << "- ##{room['id']}: new room" if rooms.include?(room) }
+    deletions.each { |id| body_lines << "- ##{id}: room deleted" }
 
     target_label = target == :own_fork ? "your own mapdb fork (pass --upstream to target #{MAPDB_UPSTREAM})" : target
     if dry_run
-      echo "[dry-run] would submit #{rooms.length} room(s) to #{target_label}:"
+      echo "[dry-run] would submit #{rooms.length + deletions.length} room(s) to #{target_label}:"
       rooms.each { |room| echo "  gs/rooms/#{room['id']}/room.json" }
+      deletions.each { |id| echo "  DELETE gs/rooms/#{id}/ (room and its proc files)" }
       echo "[dry-run] PR title: #{title}"
       body_lines.each { |line| echo "[dry-run] body: #{line}" }
       return
     end
 
     echo "Target: #{target_label}"
-    perform_submission(rooms, target, title, body_lines.join("\n"))
+    perform_submission(rooms, deletions, target, title, body_lines.join("\n"))
   end
 
-  def select_rooms(candidates, args)
+  def select_rooms(candidates, removed_ids, args)
     if args.include?('--all')
-      candidates
+      # --all never includes deletions: removing a room (and its proc files)
+      # is destructive enough that each one must be named explicitly.
+      { rooms: candidates, deletions: [] }
     elsif (list = flag_value(args, '--rooms'))
       wanted = list.split(',').map(&:strip).map(&:to_i)
-      missing = wanted - candidates.map { |r| r['id'] }
+      rooms = candidates.select { |r| wanted.include?(r['id']) }
+      deletions = removed_ids.select { |id| wanted.include?(id) }
+      missing = wanted - rooms.map { |r| r['id'] } - deletions
       unless missing.empty?
         echo "Error: room(s) #{missing.join(', ')} are not in the diff - nothing submitted"
         return nil
       end
-      candidates.select { |r| wanted.include?(r['id']) }
+      { rooms: rooms, deletions: deletions }
     else
       echo "Error: --submit needs an explicit selection: --rooms ID1,ID2 or --all"
       echo "(runtime scripts like teleport modify the in-memory mapdb, so the"
-      echo " diff may contain local-only edits that should not be submitted)"
+      echo " diff may contain local-only edits that should not be submitted;"
+      echo " rooms missing from memory can be deleted by naming them in --rooms)"
       nil
     end
   end
@@ -635,7 +651,7 @@ class CartographerManager
     args[(index + 1)..].take_while { |a| !a.start_with?('--') }.join(' ')
   end
 
-  def perform_submission(rooms, target, title, body)
+  def perform_submission(rooms, deletions, target, title, body)
     token = github_token
 
     code, user = github_request(:get, "/user", token)
@@ -707,6 +723,14 @@ class CartographerManager
     end
     return unless committed
 
+    unless deletions.empty?
+      deleted_ok = deletions.all? { |id| delete_path_recursive(work_repo, "gs/rooms/#{id}", branch) }
+      unless deleted_ok
+        echo "Error: room deletion failed - aborting before opening a pull request"
+        return
+      end
+    end
+
     head = work_repo == upstream ? branch : "#{login}:#{branch}"
     code, pr = github_request(:post, "/repos/#{upstream}/pulls", token,
                               { title: title, head: head, base: default_branch, body: body })
@@ -715,6 +739,36 @@ class CartographerManager
     else
       echo "Error: failed to open pull request (HTTP #{code})"
       echo "Your commits are on #{work_repo}@#{branch} - you can open the PR manually"
+    end
+  end
+
+  # Deletes every file under a room's directory on the given branch -
+  # room.json plus any externalized proc files - via the contents API.
+  def delete_path_recursive(repo, path, branch)
+    token = github_token
+    code, entries = github_request(:get, "/repos/#{repo}/contents/#{path}?ref=#{branch}", token)
+    return true if code == 404 # already gone
+
+    unless code == 200
+      echo "Error: cannot list #{path} (HTTP #{code})"
+      return false
+    end
+
+    entries = [entries] unless entries.is_a?(Array)
+    entries.all? do |entry|
+      if entry['type'] == 'dir'
+        delete_path_recursive(repo, entry['path'], branch)
+      else
+        del_code, = github_request(:delete, "/repos/#{repo}/contents/#{entry['path']}", token,
+                                   { message: "delete #{entry['path']} via cartographer", sha: entry['sha'], branch: branch })
+        if del_code == 200
+          echo "  deleted #{entry['path']}"
+          true
+        else
+          echo "Error: failed to delete #{entry['path']} (HTTP #{del_code})"
+          false
+        end
+      end
     end
   end
 
