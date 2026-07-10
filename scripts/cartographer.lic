@@ -467,10 +467,11 @@ class CartographerManager
         echo "Replace it with: ;cartographer --auth NEW_TOKEN"
       else
         echo "No GitHub token configured. One-time setup:"
-        echo "1. Create a fine-grained personal access token at:"
-        echo "   https://github.com/settings/personal-access-tokens/new"
-        echo "   Repository access: Public repositories (or just your mapdb fork)"
-        echo "   Permissions: Contents (read/write), Pull requests (read/write)"
+        echo "1. Create a CLASSIC personal access token at:"
+        echo "   https://github.com/settings/tokens/new"
+        echo "   Check exactly one scope: public_repo"
+        echo "   (fine-grained tokens cannot open pull requests against"
+        echo "    repositories you don't own, so they won't work here)"
         echo "2. Store it with: ;cartographer --auth YOUR_TOKEN"
       end
       return
