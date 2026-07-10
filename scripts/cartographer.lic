@@ -17,7 +17,7 @@
     ;cartographer --diff            # Compare in-memory map edits against the loaded baseline
     ;cartographer --diff --export   # Also write changed rooms as submission-ready files
     ;cartographer --auth TOKEN      # Store your GitHub token (one-time setup for --submit)
-    ;cartographer --submit --rooms 285,1448  # Open a mapdb PR with the selected diffed rooms
+    ;cartographer --submit --rooms 285,1448  # PR on your own fork; add --upstream for the real mapdb
     ;cartographer --help            # Show help
 
   author: Ondreian
@@ -115,9 +115,11 @@ class CartographerManager
     echo "  ;cartographer --diff            # Compare in-memory map edits against the loaded baseline"
     echo "  ;cartographer --diff --export   # Also write changed rooms as submission-ready files"
     echo "  ;cartographer --auth TOKEN      # Store your GitHub token (one-time setup for --submit)"
-    echo "  ;cartographer --submit --rooms 285,1448  # Open a mapdb PR with the selected diffed rooms"
+    echo "  ;cartographer --submit --rooms 285,1448  # Open a PR on YOUR mapdb fork with selected rooms"
     echo "  ;cartographer --submit --all    # Submit every diffed room (beware runtime script edits)"
-    echo "    --submit options: --message \"reason\", --dry-run, --repo owner/name"
+    echo "    --submit targets your own fork by default; add --upstream to open the PR"
+    echo "    against #{MAPDB_UPSTREAM} when your edits are ready for review"
+    echo "    other options: --message \"reason\", --dry-run, --repo owner/name"
     echo "  ;cartographer --help            # Show this help"
     echo ""
     echo "Data directory: #{@cartographer_dir}"
@@ -508,11 +510,14 @@ class CartographerManager
     [response.code.to_i, nil]
   end
 
-  # ;cartographer --submit --rooms 285,1448 [--message "why"] [--dry-run] [--repo owner/name]
+  # ;cartographer --submit --rooms 285,1448 [--upstream] [--message "why"] [--dry-run] [--repo owner/name]
   #
   # Explicit room selection is required (--rooms or --all) because runtime
   # scripts (e.g. teleport) legitimately modify the in-memory mapdb - the
   # raw diff routinely contains edits that should never be submitted.
+  #
+  # The PR targets the user's OWN fork unless --upstream (or --repo) is
+  # given, so nothing reaches the shared mapdb without a deliberate flag.
   def submit_rooms(args)
     unless github_token
       handle_auth([]) # prints setup instructions
@@ -532,7 +537,11 @@ class CartographerManager
     return unless rooms
 
     dry_run = args.include?('--dry-run')
-    upstream = flag_value(args, '--repo') || MAPDB_UPSTREAM
+    # Safe by default: PRs open on YOUR fork unless you explicitly pass
+    # --upstream (or --repo owner/name). Submitting to the shared mapdb
+    # must be a deliberate act, never a forgotten flag.
+    target = flag_value(args, '--repo')
+    target ||= args.include?('--upstream') ? MAPDB_UPSTREAM : :own_fork
     message = flag_value(args, '--message')
 
     new_ids = diff[:added].map { |r| r['id'] }
@@ -547,15 +556,17 @@ class CartographerManager
     diff[:changed].each { |room, fields| body_lines << "- ##{room['id']}: #{fields.join(', ')}" if rooms.include?(room) }
     diff[:added].each { |room| body_lines << "- ##{room['id']}: new room" if rooms.include?(room) }
 
+    target_label = target == :own_fork ? "your own mapdb fork (pass --upstream to target #{MAPDB_UPSTREAM})" : target
     if dry_run
-      echo "[dry-run] would submit #{rooms.length} room(s) to #{upstream}:"
+      echo "[dry-run] would submit #{rooms.length} room(s) to #{target_label}:"
       rooms.each { |room| echo "  gs/rooms/#{room['id']}/room.json" }
       echo "[dry-run] PR title: #{title}"
       body_lines.each { |line| echo "[dry-run] body: #{line}" }
       return
     end
 
-    perform_submission(rooms, upstream, title, body_lines.join("\n"))
+    echo "Target: #{target_label}"
+    perform_submission(rooms, target, title, body_lines.join("\n"))
   end
 
   def select_rooms(candidates, args)
@@ -584,7 +595,7 @@ class CartographerManager
     args[(index + 1)..].take_while { |a| !a.start_with?('--') }.join(' ')
   end
 
-  def perform_submission(rooms, upstream, title, body)
+  def perform_submission(rooms, target, title, body)
     token = github_token
 
     code, user = github_request(:get, "/user", token)
@@ -594,7 +605,20 @@ class CartographerManager
     end
     login = user['login']
 
+    upstream = target == :own_fork ? "#{login}/#{MAPDB_UPSTREAM.split('/').last}" : target
+
     code, repo_info = github_request(:get, "/repos/#{upstream}", token)
+    if code == 404 && target == :own_fork
+      # First submission and no fork yet - create one.
+      up_code, upstream_info = github_request(:get, "/repos/#{MAPDB_UPSTREAM}", token)
+      unless up_code == 200
+        echo "Error: cannot read #{MAPDB_UPSTREAM} (HTTP #{up_code})"
+        return
+      end
+      return unless ensure_fork(login, MAPDB_UPSTREAM, upstream_info['default_branch'])
+
+      code, repo_info = github_request(:get, "/repos/#{upstream}", token)
+    end
     unless code == 200
       echo "Error: cannot read repo #{upstream} (HTTP #{code})"
       return
