@@ -14,13 +14,18 @@
     ;cartographer --force           # Force re-download of latest version
     ;cartographer --info            # Show architecture and storage information
     ;cartographer --prune           # Remove all but the 3 newest versions
+    ;cartographer --diff            # Compare in-memory map edits against the loaded baseline
+    ;cartographer --diff --export   # Also write changed rooms as submission-ready files
     ;cartographer --help            # Show help
 
   author: Ondreian
   contributors: Claude Code, Nisugi
-  version: 1.1.0
+  version: 1.2.0
 
   changelog:
+    v1.2.0 - add --diff: compare in-memory map edits against the loaded
+             release baseline, with --export writing changed rooms as
+             submission-ready per-room JSON (mapdb repo layout)
     v1.1.0 - read stringprocs tarball in binary mode (Windows fix); cache
              StringProc file reads; failed timeto procs mark the edge
              unroutable instead of returning a fake 0.2; Map.load_cartographer
@@ -35,7 +40,7 @@ require 'json'
 require 'fileutils'
 
 class CartographerManager
-  VERSION = "1.1.0"
+  VERSION = "1.2.0"
   GITHUB_API_BASE = "https://api.github.com/repos/elanthia-online/mapdb"
 
   def initialize
@@ -58,6 +63,8 @@ class CartographerManager
       show_info
     when '--prune', '-p'
       prune_old_versions
+    when '--diff', '-d'
+      diff_versus_baseline(args.include?('--export'))
     when '--force'
       download_and_load_latest(true)
     when '--load'
@@ -94,6 +101,8 @@ class CartographerManager
     echo "  ;cartographer --force           # Force re-download of latest version"
     echo "  ;cartographer --info            # Show architecture and storage information"
     echo "  ;cartographer --prune           # Remove all but the 3 newest versions"
+    echo "  ;cartographer --diff            # Compare in-memory map edits against the loaded baseline"
+    echo "  ;cartographer --diff --export   # Also write changed rooms as submission-ready files"
     echo "  ;cartographer --help            # Show this help"
     echo ""
     echo "Data directory: #{@cartographer_dir}"
@@ -299,6 +308,120 @@ class CartographerManager
     # Show remaining versions
     remaining_versions = get_local_versions
     echo "Remaining versions: #{remaining_versions.join(', ')}"
+  end
+
+  # Compares the in-memory Map against the pristine release it was loaded
+  # from, reporting rooms a map editor has changed or added. Untouched rooms
+  # round-trip byte-identically (StringProcs serialize back to the same
+  # ";e Cartographer.evaluate_script(...)" strings the release contains), so
+  # anything that differs is a real edit.
+  def diff_versus_baseline(export = false)
+    unless defined?(Map) && Map.respond_to?(:cartographer_version) && Map.cartographer_version
+      echo "Error: no cartographer version loaded - run ;cartographer first"
+      echo "(the diff needs a pristine release on disk to compare against)"
+      return
+    end
+
+    version = Map.cartographer_version
+    baseline_path = version_mapdb_path(version)
+    unless File.exist?(baseline_path)
+      echo "Error: baseline mapdb.json missing for version #{version}"
+      return
+    end
+
+    echo "Comparing in-memory map against baseline v#{version}..."
+    baseline = {}
+    JSON.parse(File.read(baseline_path)).each { |room| baseline[room['id']] = normalize_room(room) }
+
+    added = []
+    changed = []
+    seen = {}
+    Map.list.compact.each do |room|
+      current = normalize_room(JSON.parse(room.to_json))
+      id = current['id']
+      seen[id] = true
+      base = baseline[id]
+      if base.nil?
+        added << current
+      else
+        fields = diff_fields(base, current)
+        changed << [current, fields] unless fields.empty?
+      end
+    end
+    removed = baseline.keys.reject { |id| seen[id] }.sort
+
+    if added.empty? && changed.empty? && removed.empty?
+      echo "No differences - in-memory map matches baseline v#{version}"
+      return
+    end
+
+    changed.sort_by! { |room, _fields| room['id'] }
+    added.sort_by! { |room| room['id'] }
+
+    echo "#{changed.length} changed, #{added.length} new, #{removed.length} removed (vs baseline v#{version}):"
+    changed.each { |room, fields| echo "  ##{room['id']}: #{fields.join(', ')}" }
+    added.each { |room| echo "  ##{room['id']}: new room" }
+    removed.each { |id| echo "  ##{id}: in baseline but missing from memory" }
+
+    if export
+      export_pending(changed.map(&:first) + added)
+    else
+      echo ""
+      echo "Use ';cartographer --diff --export' to write submission-ready room files"
+    end
+  end
+
+  # Field-level difference summary between two normalized room hashes.
+  # For wayto/timeto, names the specific destination rooms that changed.
+  def diff_fields(base, current)
+    fields = []
+    (base.keys | current.keys).each do |key|
+      b = base[key]
+      c = current[key]
+      next if b == c
+
+      if b.is_a?(Hash) && c.is_a?(Hash)
+        targets = (b.keys | c.keys).reject { |t| b[t] == c[t] }.sort_by(&:to_i)
+        fields << "#{key} (-> #{targets.join(', ')})"
+      else
+        fields << key
+      end
+    end
+    fields
+  end
+
+  # Applies Map#to_json's output conventions to a raw room hash so baseline
+  # and in-memory rooms compare on equal terms: nils and empty arrays are
+  # dropped, tags sort case-insensitively. The raw-string tiebreak matters:
+  # Map#to_json sorts tags with an unstable sort, so case-duplicate tags
+  # ("Whirlin"/"whirlin" - six rooms in mapdb 0.3.0 have these) permute
+  # between serializations unless the comparison order is total.
+  # wayto/timeto need no ordering help because Hash#== ignores key order.
+  def normalize_room(hash)
+    room = {}
+    hash.each do |key, value|
+      next if value.nil?
+      next if value.is_a?(Array) && value.empty?
+
+      room[key] = value
+    end
+    room['tags'] = room['tags'].sort_by { |tag| [tag.downcase, tag] } if room['tags']
+    room
+  end
+
+  # Writes changed/new rooms as one room.json per room, mirroring the mapdb
+  # repo layout (gs/rooms/{id}/room.json). Rooms are written in raw form -
+  # StringProcs as inline ";e" strings, no checksum - because the mapdb CI
+  # normalizes submissions (externalizes procs, computes checksums) itself.
+  def export_pending(rooms)
+    pending_dir = File.join(@cartographer_dir, 'pending')
+    FileUtils.rm_rf(pending_dir)
+    rooms.each do |room|
+      dir = File.join(pending_dir, 'rooms', room['id'].to_s)
+      FileUtils.mkdir_p(dir)
+      File.write(File.join(dir, 'room.json'), JSON.pretty_generate({ 'room' => room }))
+    end
+    echo "Exported #{rooms.length} room(s) to #{pending_dir}"
   end
 
   def load_version(version)
