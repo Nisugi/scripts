@@ -16,15 +16,19 @@
     ;cartographer --prune           # Remove all but the 3 newest versions
     ;cartographer --diff            # Compare in-memory map edits against the loaded baseline
     ;cartographer --diff --export   # Also write changed rooms as submission-ready files
+    ;cartographer --source owner/repo  # Download releases from a fork (--source default resets)
     ;cartographer --auth TOKEN      # Store your GitHub token (one-time setup for --submit)
     ;cartographer --submit --rooms 285,1448  # PR on your own fork; add --upstream for the real mapdb
     ;cartographer --help            # Show help
 
   author: Ondreian
   contributors: Claude Code, Nisugi
-  version: 1.3.0
+  version: 1.4.0
 
   changelog:
+    v1.4.0 - add --source: override which repo releases are downloaded from
+             (persisted), enabling a full edit->submit->merge->release->
+             download rehearsal against a fork
     v1.3.0 - add --submit: open a mapdb pull request with selected diffed
              rooms via the GitHub API (no git client needed); --auth stores
              the token; --dry-run previews; --repo overrides the target
@@ -47,12 +51,24 @@ require 'json'
 require 'fileutils'
 
 class CartographerManager
-  VERSION = "1.3.0"
-  GITHUB_API_BASE = "https://api.github.com/repos/elanthia-online/mapdb"
+  VERSION = "1.4.0"
+  DEFAULT_MAPDB_REPO = "elanthia-online/mapdb"
 
   def initialize
     @cartographer_dir = File.join(DATA_DIR, XMLData.game, '_cartographer')
     FileUtils.mkdir_p(@cartographer_dir) unless Dir.exist?(@cartographer_dir)
+  end
+
+  # The repo releases are downloaded from. Overridable (persisted in
+  # UserVars) so a full edit->submit->merge->release->download loop can be
+  # rehearsed against a fork without touching the shared mapdb.
+  def mapdb_repo
+    override = UserVars.cartographer_mapdb_repo if defined?(UserVars)
+    override && !override.to_s.empty? ? override.to_s : DEFAULT_MAPDB_REPO
+  end
+
+  def github_api_base
+    "https://api.github.com/repos/#{mapdb_repo}"
   end
 
   def run(args = [])
@@ -76,6 +92,8 @@ class CartographerManager
       submit_rooms(args)
     when '--auth'
       handle_auth(args)
+    when '--source'
+      handle_source(args)
     when '--force'
       download_and_load_latest(true)
     when '--load'
@@ -114,6 +132,7 @@ class CartographerManager
     echo "  ;cartographer --prune           # Remove all but the 3 newest versions"
     echo "  ;cartographer --diff            # Compare in-memory map edits against the loaded baseline"
     echo "  ;cartographer --diff --export   # Also write changed rooms as submission-ready files"
+    echo "  ;cartographer --source owner/repo  # Download releases from a fork (--source default resets)"
     echo "  ;cartographer --auth TOKEN      # Store your GitHub token (one-time setup for --submit)"
     echo "  ;cartographer --submit --rooms 285,1448  # Open a PR on YOUR mapdb fork with selected rooms"
     echo "  ;cartographer --submit --all    # Submit every diffed room (beware runtime script edits)"
@@ -243,7 +262,8 @@ class CartographerManager
 
     echo ""
     echo "GitHub Repository: https://github.com/elanthia-online/mapdb"
-    echo "Release API: #{GITHUB_API_BASE}/releases"
+    echo "Release source: #{mapdb_repo}#{mapdb_repo == DEFAULT_MAPDB_REPO ? '' : ' (override - see --source)'}"
+    echo "Release API: #{github_api_base}/releases"
     echo ""
 
     # Map integration status
@@ -460,6 +480,26 @@ class CartographerManager
   # ---------------------------------------------------------------------
 
   MAPDB_UPSTREAM = "elanthia-online/mapdb"
+
+  # ;cartographer --source            -> show the current release source
+  # ;cartographer --source owner/repo -> download releases from a fork
+  # ;cartographer --source default    -> back to the shared mapdb
+  def handle_source(args)
+    value = args[2]
+    if value.nil?
+      echo "Release source: #{mapdb_repo}#{mapdb_repo == DEFAULT_MAPDB_REPO ? ' (default)' : ''}"
+      echo "Change with ';cartographer --source owner/repo' or reset with ';cartographer --source default'"
+    elsif value.casecmp('default').zero?
+      UserVars.cartographer_mapdb_repo = nil if defined?(UserVars)
+      echo "Release source reset to #{DEFAULT_MAPDB_REPO}"
+    elsif value =~ %r{\A[\w.-]+/[\w.-]+\z}
+      UserVars.cartographer_mapdb_repo = value if defined?(UserVars)
+      echo "Release source set to #{value}"
+      echo "Note: map data (including executable StringProcs) will now come from this repo's releases - only point at repos you trust"
+    else
+      echo "Error: --source expects owner/repo (e.g. Nisugi/mapdb) or 'default'"
+    end
+  end
 
   def handle_auth(args)
     token = args[2]
@@ -728,7 +768,7 @@ class CartographerManager
   def download_and_load_latest(force = false)
     echo "Fetching latest release information..."
 
-    release_info = fetch_json("#{GITHUB_API_BASE}/releases/latest")
+    release_info = fetch_json("#{github_api_base}/releases/latest")
     return unless release_info
 
     version = release_info['tag_name'].sub(/^v/, '')
@@ -758,7 +798,7 @@ class CartographerManager
 
     echo "Fetching release information for #{api_version}..."
 
-    release_info = fetch_json("#{GITHUB_API_BASE}/releases/tags/#{api_version}")
+    release_info = fetch_json("#{github_api_base}/releases/tags/#{api_version}")
     return unless release_info
 
     download_and_load_release(release_info, normalized_version)
