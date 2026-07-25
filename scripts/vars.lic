@@ -9,9 +9,13 @@
    game: Gemstone
    tags: core
    required: Lich > 5.0.1
-   version: 1.2.0
+   version: 1.3.0
 
   changelog:
+    1.3.0 (2026-07-06)
+      ;vars setup renders in the browser via the Lich WebUI when enabled (;ui on);
+      edits save on Enter/blur, deletes and adds are immediate. GTK window remains
+      the fallback when WebUI is disabled.
     1.2.0 (2023-12-04)
       Allowed setting of vars to boolean values true/false
     1.1 (2023-09-07)
@@ -72,6 +76,67 @@ elsif script.vars[1] == 'list'
     }
     output.concat "\n"
     respond output
+  end
+elsif (script.vars[1] == 'setup') and defined?(UI) and UI.available?
+  done_queue = Queue.new
+  UI.page('setup', title: "#{XMLData.name}'s Vars") do |ui|
+    ui.header "#{XMLData.name}'s Variables"
+    ui.markdown 'Value edits save when you press **Enter** or leave the field. Deletes and adds are immediate.'
+    ui.divider
+
+    vars_list = Vars.list.to_a.sort { |a, b| a[0].to_s <=> b[0].to_s }
+    ui.text 'No variables are set.' if vars_list.empty?
+    vars_list.each do |name, value|
+      ui.columns(2, key: "row_#{name}") do |main, actions|
+        if value.class == String
+          main.text_input(name.to_s, value: value, key: "val_#{name}") { |v|
+            Vars[name] = v
+            respond "--- vars: #{name} changed to: #{v}"
+          }
+        else
+          main.text "#{name}  =  #{value.class}: #{value.inspect}  (not editable here)"
+        end
+        actions.button('Delete', variant: :danger, key: "del_#{name}") {
+          Vars[name] = nil
+          respond "--- vars: #{name} was deleted"
+        }
+      end
+    end
+
+    ui.divider
+    ui.header 'Add a variable'
+    ui.text_input('Name', value: ui.state[:new_name], key: :new_name) { |v| ui.state[:new_name] = v.strip }
+    ui.text_input('Value', value: ui.state[:new_value], key: :new_value) { |v| ui.state[:new_value] = v }
+    ui.button('Add', key: :add) {
+      new_name = ui.state[:new_name].to_s
+      new_value = ui.state[:new_value].to_s
+      if new_name.empty?
+        respond '--- vars: ignoring new variable with no name'
+      elsif Vars.list.keys.include?(new_name)
+        respond "--- vars: variable #{new_name} already exists; ignoring"
+      else
+        if new_value.downcase == 'true'
+          Vars[new_name] = true
+        elsif new_value.downcase == 'false'
+          Vars[new_name] = false
+        else
+          Vars[new_name] = new_value
+        end
+        ui.state[:new_name] = nil
+        ui.state[:new_value] = nil
+        respond "--- vars: variable \"#{new_name}\" set to: \"#{new_value}\""
+      end
+    }
+
+    ui.divider
+    ui.button('Done', key: :done) { done_queue << true }
+  end
+
+  respond "--- vars: setup page ready - open it with #{$clean_lich_char}ui#{" (#{UI.url}#/vars/setup)" if UI.url}"
+  begin
+    done_queue.pop
+  ensure
+    UI.remove('setup')
   end
 elsif defined?(Gtk) and (script.vars[1] == 'setup')
   window = nil
@@ -216,7 +281,7 @@ elsif defined?(Gtk) and (script.vars[1] == 'setup')
   end
 else
   output = "\n"
-  output.concat "   #{$clean_lich_char}#{script.name} setup              open a window to edit variables\n" if defined?(Gtk)
+  output.concat "   #{$clean_lich_char}#{script.name} setup              open a window to edit variables\n" if defined?(Gtk) || (defined?(UI) && UI.available?)
   output.concat "   #{$clean_lich_char}#{script.name} set NAME=VALUE     add or change a variable\n"
   output.concat "   #{$clean_lich_char}#{script.name} delete NAME        delete a variable\n"
   output.concat "   #{$clean_lich_char}#{script.name} list               show current variables\n"

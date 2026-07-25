@@ -9,11 +9,15 @@
    game: Gemstone
    tags: core, alias
    required: Lich > 5.0.1
-   version: 1.0.5
+   version: 1.1.0
 
   Help Contribute: https://github.com/elanthia-online/scripts
 
    changelog:
+      1.1.0 (2026-07-06)
+         ;alias setup renders in the browser via the Lich WebUI when enabled (;ui on);
+         edits save on Enter/blur, deletes and adds are immediate and refresh the
+         running alias service. GTK window remains the fallback when WebUI is disabled.
       1.0.5 (2026-06-30)
          Updated for 5.19.0 Lich to include new hook registry semantics
       1.0.4 (2025-01-31)
@@ -91,9 +95,88 @@ update_regex = proc {
 
 update_regex.call
 
+# Browser-based setup via the Lich WebUI (;ui). The alias service itself is a
+# persistent UpstreamHook with no living script, so setup runs as its own
+# script instance: the hook passes ";alias setup" through when the WebUI is
+# available, this instance owns the page and blocks until Done. The running
+# service's trigger regexes live in the original instance's closure, so every
+# change refreshes them by sending ";alias reload" through the hook.
+if Script.current.vars[1] =~ /^setup$/i and defined?(UI) and UI.available?
+  done_queue = Queue.new
+  reload_service = proc {
+    do_client("#{$clean_lich_char}alias reload\n") if UpstreamHook.list.include?('alias-service')
+  }
+
+  UI.page('setup', title: 'Aliases') do |ui|
+    ui.header 'Aliases'
+    ui.markdown 'Edits save when you press **Enter** or leave the field. Deletes and adds are immediate.'
+
+    char_aliases = db.execute("SELECT trigger,target FROM #{character};").to_a.sort { |a, b| a[0].to_s <=> b[0].to_s }
+    global_aliases = db.execute('SELECT trigger,target FROM global;').to_a.sort { |a, b| a[0].to_s <=> b[0].to_s }
+
+    ui.tabs(["#{XMLData.name}'s Aliases", 'Global Aliases']) do |char_tab, global_tab|
+      [[char_tab, character, char_aliases, 'char'], [global_tab, 'global', global_aliases, 'glob']].each do |tab, table, aliases, prefix|
+        tab.text '(none yet)' if aliases.empty?
+        aliases.each do |trigger, target|
+          tab.columns(2, key: "#{prefix}_row_#{trigger}") do |main, actions|
+            main.text_input(trigger.to_s, value: target.to_s, key: "#{prefix}_val_#{trigger}") { |v|
+              db.execute("INSERT OR REPLACE INTO #{table} (trigger,target) VALUES(?,?);", [trigger.encode('UTF-8'), v.encode('UTF-8')])
+              reload_service.call
+              respond "--- alias: #{trigger} updated"
+            }
+            actions.button('Delete', variant: :danger, key: "#{prefix}_del_#{trigger}") {
+              db.execute("DELETE FROM #{table} WHERE trigger=?", [trigger.encode('UTF-8')])
+              reload_service.call
+              respond "--- alias: #{trigger} deleted"
+            }
+          end
+        end
+
+        tab.divider
+        tab.header 'Add an alias'
+        tab.text_input('Trigger', value: ui.state[:"#{prefix}_new_trigger"], key: "#{prefix}_new_trigger") { |v| ui.state[:"#{prefix}_new_trigger"] = v.strip }
+        tab.text_input('Target', value: ui.state[:"#{prefix}_new_target"], key: "#{prefix}_new_target") { |v| ui.state[:"#{prefix}_new_target"] = v }
+        tab.button('Add', key: "#{prefix}_add") {
+          new_trigger = ui.state[:"#{prefix}_new_trigger"].to_s
+          new_target = ui.state[:"#{prefix}_new_target"].to_s
+          if new_trigger.empty?
+            respond '--- alias: ignoring new alias with no trigger'
+          elsif db.get_first_value("SELECT target FROM #{table} WHERE trigger=? COLLATE NOCASE;", new_trigger.encode('UTF-8'))
+            respond "--- alias: #{new_trigger} already exists; ignoring"
+          else
+            db.execute("INSERT INTO #{table} (trigger,target) VALUES(?,?);", [new_trigger.encode('UTF-8'), new_target.encode('UTF-8')])
+            ui.state[:"#{prefix}_new_trigger"] = nil
+            ui.state[:"#{prefix}_new_target"] = nil
+            reload_service.call
+            respond "--- alias: #{new_trigger} added"
+          end
+        }
+      end
+    end
+
+    ui.divider
+    ui.markdown 'Tip: `\\r` in a target sends multiple commands, `\\?` inserts arguments - see `;alias help`.'
+    ui.button('Done', key: :done) { done_queue << true }
+  end
+
+  respond "--- alias: setup page ready - open it with #{$clean_lich_char}ui#{" (#{UI.url}#/alias/setup)" if UI.url}"
+  begin
+    done_queue.pop
+  ensure
+    UI.remove('setup')
+  end
+  exit
+end
+
 hook_proc = proc { |client_string|
   if client_string =~ /^(?:<c>)?#{$lich_char}alias\s+(.*)/
     args = $1
+    if (args == 'setup') and defined?(UI) and UI.available?
+      # WebUI setup runs as its own ;alias script instance (which owns the
+      # page and its callbacks) - pass the command through untouched so
+      # do_client starts it.
+      next client_string
+    end
     if (args == 'setup') and defined?(Gtk)
       if defined?($alias_setup_window) and not $alias_setup_window.nil?
         $alias_setup_window.present # fixme: show window
@@ -425,7 +508,7 @@ hook_proc = proc { |client_string|
       output = "\n"
       output.concat "Usage:\n"
       output.concat "\n"
-      if defined?(Gtk)
+      if defined?(Gtk) || (defined?(UI) && UI.available?)
         output.concat "     #{$clean_lich_char}alias setup\n"
         output.concat "          Opens a window to configure aliases.\n"
       end

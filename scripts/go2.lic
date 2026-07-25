@@ -10,10 +10,14 @@
       contributors: Deysh, Doug, Gildaren, Sarvatt, Tysong, Xanlin, Dissonance
               game: any
               tags: core, movement
-           version: 2.3.2
+           version: 2.4.0
           required: Lich >= 5.12.0
 
    changelog:
+      2.4.0 (2026-07-06)
+        ;go2 setup now renders in the browser via the Lich WebUI when enabled (;ui on),
+        with live-saving controls; falls back to the GTK window when WebUI is disabled.
+        Custom targets remain command-line only.
       2.3.2 (2026-07-02)
         Change Society call to updated API call
       2.3.1 (2026-06-30)
@@ -462,6 +466,102 @@ module Go2
     CharSettings['hide_room_titles']        = settings[:hide_room_titles]
     CharSettings['use_gigas_hwtravel']      = settings[:use_gigas_hwtravel]
     CharSettings['gigas_min_number']        = settings[:gigas_min_number]
+  end
+
+  # Same defaults the GTK Setup class seeds (Setup @@categories[:general]);
+  # duplicated here so the WebUI path works when GTK is not loaded at all.
+  WEBUI_SETUP_DEFAULTS = {
+    mapdb_car_to_sos: false, mapdb_car_from_sos: false, mapdb_ice_mode: false,
+    mapdb_use_urchins: false, mapdb_use_portmasters: false, mapdb_use_day_pass: false,
+    mapdb_buy_day_pass: '', mapdb_day_pass_sack: '', mapdb_fwi_trinket: '',
+    mapdb_use_portals: false, mapdb_use_old_portals: false,
+    typeahead: 0, delay: 0, use_vaalor_shortcut: false,
+    get_silvers: false, get_return_silvers: false,
+    hide_room_desc: false, hide_room_titles: false, echo_input: true,
+    use_seeking: false, stop_for_dead: false, rogue_password: '',
+    use_gigas_hwtravel: false, gigas_min_number: 4
+  }.freeze
+
+  # Browser-based settings page via the Lich WebUI (;ui). Replaces the GTK
+  # Setup window: every control saves immediately, no Close-button dance.
+  # Blocks until the user clicks Done (parity with Setup#start).
+  def self.webui_setup
+    settings = load_go2_settings
+    WEBUI_SETUP_DEFAULTS.each { |key, value| settings[key] = value if settings[key].nil? }
+    gs = XMLData.game !~ /^DR/
+    done = Queue.new
+    set = proc { |key, value| settings[key] = value; save_go2_settings(settings) }
+
+    UI.page('setup', title: "Go2 Setup v#{get_script_version}") do |ui|
+      ui.header "Go2 Setup v#{get_script_version}"
+      ui.markdown 'Changes save **immediately**. Custom targets are still command-line only - see `;go2 help`.'
+
+      if gs
+        ui.tabs(['Misc', 'Portals & Passes']) do |misc, portals|
+          misc.columns(3) do |c1, c2, c3|
+            c1.checkbox('Get Silvers', checked: settings[:get_silvers], key: :get_silvers) { |v| set.call(:get_silvers, v) }
+            c1.checkbox('Get Return Silvers', checked: settings[:get_return_silvers], key: :get_return_silvers) { |v| set.call(:get_return_silvers, v) }
+            c1.checkbox('Hide Room Desc', checked: settings[:hide_room_desc], key: :hide_room_desc) { |v| set.call(:hide_room_desc, v) }
+            c1.checkbox('Hide Room Titles', checked: settings[:hide_room_titles], key: :hide_room_titles) { |v| set.call(:hide_room_titles, v) }
+            c2.checkbox('Caravan to SoS', checked: settings[:mapdb_car_to_sos], key: :car_to_sos) { |v| set.call(:mapdb_car_to_sos, v) }
+            c2.checkbox('Caravan from SoS', checked: settings[:mapdb_car_from_sos], key: :car_from_sos) { |v| set.call(:mapdb_car_from_sos, v) }
+            c2.checkbox('Use Urchins', checked: settings[:mapdb_use_urchins], key: :use_urchins) { |v| set.call(:mapdb_use_urchins, v) }
+            c2.checkbox('Use Portmasters', checked: settings[:mapdb_use_portmasters], key: :use_portmasters) { |v| set.call(:mapdb_use_portmasters, v) }
+            c3.checkbox('Use Seeking', checked: settings[:use_seeking], key: :use_seeking) { |v| set.call(:use_seeking, v) }
+            c3.checkbox('Stop for Dead', checked: settings[:stop_for_dead], key: :stop_for_dead) { |v| set.call(:stop_for_dead, v) }
+            c3.checkbox('Use Vaalor Shortcut', checked: settings[:use_vaalor_shortcut], key: :vaalor) { |v| set.call(:use_vaalor_shortcut, v) }
+            c3.checkbox('Echo Input', checked: settings[:echo_input], key: :echo_input) { |v| set.call(:echo_input, v) }
+          end
+          misc.text 'Vaalor shortcut: climbing and/or swimming training recommended.'
+          misc.divider
+          misc.slider('Type Ahead', min: 0, max: 100, value: settings[:typeahead].to_i, key: :typeahead) { |v| set.call(:typeahead, v.to_i) }
+          misc.slider('Delay', min: 0, max: 600, value: settings[:delay].to_i, key: :delay) { |v| set.call(:delay, v.to_i) }
+          ice = settings[:mapdb_ice_mode].to_s.downcase
+          ice = 'auto' unless %w[auto wait run].include?(ice)
+          misc.select('Ice Mode', options: %w[auto wait run], value: ice, key: :ice_mode) { |v| set.call(:mapdb_ice_mode, v) }
+          if Stats.prof == 'Rogue'
+            misc.text_input('Rogue Password', value: settings[:rogue_password].to_s,
+                            placeholder: 'pull, push, tap...whatever. There should be 7 actions',
+                            key: :rogue_password) { |v| set.call(:rogue_password, v.strip) }
+          end
+
+          portals.text_input('FWI Trinket', value: settings[:mapdb_fwi_trinket].to_s,
+                             placeholder: "name of FWI trinket or 'off' to stop using it",
+                             key: :fwi_trinket) { |v| set.call(:mapdb_fwi_trinket, v.strip) }
+          if XMLData.game =~ /^GSPlat|^GSF/
+            portals.checkbox('Use Portals (Plat and Shattered Only)', checked: settings[:mapdb_use_portals], key: :use_portals) { |v| set.call(:mapdb_use_portals, v) }
+          end
+          if XMLData.game =~ /^GSPlat/
+            portals.checkbox('Use Old Portals (Plat Only)', checked: settings[:mapdb_use_old_portals], key: :use_old_portals) { |v| set.call(:mapdb_use_old_portals, v) }
+          end
+          portals.checkbox('Use Day Pass', checked: settings[:mapdb_use_day_pass], key: :use_day_pass) { |v| set.call(:mapdb_use_day_pass, v) }
+          portals.text_input('Buy Day Pass', value: settings[:mapdb_buy_day_pass].to_s,
+                             placeholder: '<on|off|locations like wl,imt;imt,sol>',
+                             key: :buy_day_pass) { |v| set.call(:mapdb_buy_day_pass, v.strip) }
+          portals.text_input('Day Pass Sack', value: settings[:mapdb_day_pass_sack].to_s,
+                             key: :day_pass_sack) { |v| set.call(:mapdb_day_pass_sack, v.strip) }
+          portals.divider
+          portals.header 'Hinterwilds Travel Options'
+          portals.checkbox('Use Gigas Fragments', checked: settings[:use_gigas_hwtravel], key: :gigas) { |v| set.call(:use_gigas_hwtravel, v) }
+          portals.slider('Minimum fragments before using', min: 4, max: 20, value: settings[:gigas_min_number].to_i, key: :gigas_min) { |v| set.call(:gigas_min_number, v.to_i) }
+        end
+      else
+        ui.checkbox('Echo Input', checked: settings[:echo_input], key: :echo_input) { |v| set.call(:echo_input, v) }
+        ui.checkbox('Hide Room Desc', checked: settings[:hide_room_desc], key: :hide_room_desc) { |v| set.call(:hide_room_desc, v) }
+        ui.checkbox('Hide Room Titles', checked: settings[:hide_room_titles], key: :hide_room_titles) { |v| set.call(:hide_room_titles, v) }
+        ui.divider
+        ui.slider('Type Ahead', min: 0, max: 100, value: settings[:typeahead].to_i, key: :typeahead) { |v| set.call(:typeahead, v.to_i) }
+        ui.slider('Delay', min: 0, max: 600, value: settings[:delay].to_i, key: :delay) { |v| set.call(:delay, v.to_i) }
+      end
+
+      ui.divider
+      ui.button('Done', key: :done) { done << true }
+    end
+
+    respond "--- go2: setup page ready - open it with ;ui#{" (#{UI.url}#/go2/setup)" if UI.url}"
+    done.pop
+    UI.remove('setup')
+    respond '--- go2: setup closed; settings saved.'
   end
 
   if defined?(Gtk)
@@ -1004,8 +1104,14 @@ module Go2
     show_help.call
     exit
   elsif Script.current.vars[0] =~ /^setup$/i
-    Setup.new(Go2.load_go2_settings).start
-    Go2.save_go2_settings(Go2.data)
+    if defined?(UI) && UI.available?
+      Go2.webui_setup
+    elsif defined?(Gtk)
+      Setup.new(Go2.load_go2_settings).start
+      Go2.save_go2_settings(Go2.data)
+    else
+      respond 'go2: no UI available. Enable the browser UI with ;ui on, or use command-line options (see ;go2 help).'
+    end
     exit
   elsif Script.current.vars[0] =~ /^targets$/i
     echo 'generating list...'

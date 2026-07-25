@@ -10,9 +10,17 @@
           game: any
           tags: core
       required: Lich > 5.0.1
-       version: 2.73
+       version: 2.75
 
   changelog:
+    2.75 (2026-07-06):
+      WebUI browser page reworked to the GTK window layout: scrolling table
+      (pinned headings) on the left, download/comments detail panel on the
+      right, Close at the bottom. No more page-length table.
+    2.74 (2026-07-06):
+      ;repository gui renders in the browser via the Lich WebUI when enabled (;ui on):
+      sortable table, keyword search, row selection with comments and download.
+      GTK window remains the fallback when WebUI is disabled.
     2.73 (2026-05-12):
       Validate scripts and map databases for non-ASCII characters before upload
       Aborts upload with a per-character report (line, column, codepoint) when found
@@ -2746,14 +2754,95 @@ module RepositoryTillmen
     end
 
     def execute_gui
+      if defined?(UI) && UI.available?
+        list = repo_list.fetch_list
+        list = repo_list.add_comments_to_list(list)
+        execute_webui_gui(list)
+        return
+      end
+
       unless defined?(Gtk)
-        echo "error: no gtk"
+        echo "error: no gtk (enable the browser UI with #{$clean_lich_char}ui on)"
         exit
       end
 
       list = repo_list.fetch_list
       list = repo_list.add_comments_to_list(list)
       RepositoryGUI::Setup.new(list)
+    end
+
+    # Browser-based repository browser via the Lich WebUI (;ui): sortable
+    # table, keyword search across all columns, click a row for comments and
+    # a download button. Blocks until Close, like the GTK window.
+    def execute_webui_gui(list)
+      data = list[1..-1].sort_by { |row| row.first.downcase }
+      done_queue = Queue.new
+
+      format_rows = proc { |entries|
+        entries.map { |item|
+          votes = item[7].to_i
+          rating = votes.positive? ? (item[6].to_f / item[7].to_f).to_s.slice(/^[0-9]+(?:\.[0-9])?/) : ''
+          [item[0], item[1],
+           "#{(item[2].to_f / 1024).to_s.slice(/^[0-9]+(?:\.[0-9])?/)}k",
+           Time.at(item[3].to_i).strftime('%Y-%m-%d'),
+           item[4], item[5].to_s, rating,
+           (votes.positive? ? votes.to_s : ''), item[8].to_s]
+        }
+      }
+
+      filter_data = proc { |search|
+        search = search.to_s.downcase.strip
+        if search.empty?
+          data
+        else
+          data.select { |item| item.any? { |column| column.to_s.downcase.include?(search) } }
+        end
+      }
+
+      # GTK-window layout: scrolling table on the left, detail panel
+      # (download + comments) on the right, Close at the bottom.
+      UI.page('browser', title: 'Repository Search') do |ui|
+        ui.header 'Repository Search'
+
+        entries = filter_data.call(ui.state[:search])
+        selected = ui.state[:selected]
+        selected = nil if selected && entries[selected].nil?
+
+        ui.columns(2, weights: [7, 3], key: :body) do |listing, detail|
+          listing.text_input('Keyword search', value: ui.state[:search], placeholder: 'matches any column',
+                             key: :search) { |v| ui.state[:search] = v; ui.state[:selected] = nil }
+          listing.text "#{entries.length} script(s)"
+          listing.table(format_rows.call(entries),
+                        headings: ['File Name', 'Game', 'Size', 'Last Updated', 'Author', 'DLs', 'Rating', 'Votes', 'Tags'],
+                        sortable: true, selected: selected, max_height: 520,
+                        key: :repo) { |index| ui.state[:selected] = index }
+
+          if selected && (item = entries[selected])
+            detail.button("Download #{item[0]}", key: :download) {
+              Script.run('repository', "download #{item[0]} --author=#{item[4]} --game=#{item[1]}", force: true)
+            }
+            detail.markdown "**#{item[0]}** by #{item[4]}"
+            comments = item[9].to_s.strip
+            if comments.empty?
+              detail.text 'No comments for this script.'
+            else
+              comments.split("\n").each { |line| detail.text line }
+            end
+          else
+            detail.text 'Click a row to see comments and download.'
+          end
+        end
+
+        ui.divider
+        ui.button('Close', key: :close) { done_queue << true }
+      end
+
+      respond "--- repository: browser ready - open it with #{$clean_lich_char}ui#{" (#{UI.url}#/repository/browser)" if UI.url}"
+      begin
+        done_queue.pop
+      ensure
+        UI.remove('browser')
+      end
     end
 
     def execute_upload

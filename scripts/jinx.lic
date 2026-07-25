@@ -13,9 +13,14 @@
 
    author: elanthia-online
      tags: utility, util, repository, repo, update, upgrade, meta, ruby, development
-  version: 0.8.1
+  version: 0.9.0
 
   Changelog:
+  0.9.0 (2026-07-06)
+    ;jinx gui renders in the browser via the Lich WebUI when enabled (;ui on):
+    sortable/clickable repo, script, and data tables with search, info,
+    install/update (with force), repo management, and an activity log.
+    GTK window remains the fallback when WebUI is disabled.
   0.8.1 (2026-02-07)
     fix constant redefinition on subsequent launches
   0.8.0 (2026-01-08)
@@ -1421,8 +1426,11 @@ module ::Lich
             return CLI.auto_update(force: argv.force, dry_run: argv.dry_run || argv.dry)
           end
 
-          # jinx gui - launch GUI interface
+          # jinx gui - launch GUI interface (browser WebUI when enabled, else GTK)
           if argv.gui.eql?(true)
+            if defined?(UI) && UI.available?
+              return ::Lich::Common::Jinx::WebGUI.start!
+            end
             begin
               require 'gtk3'
               return ::Lich::Common::Jinx::GUI.start!
@@ -1765,6 +1773,246 @@ end
 module ::Lich
   module Common
     module Jinx
+      # Browser-based GUI via the Lich WebUI (;ui). Reuses the GTK GUI
+      # module's non-GTK helpers (manifests, install/modified status) and the
+      # same CLI seams; renders repos/scripts/data as sortable, clickable
+      # tables with install/update/info actions.
+      module WebGUI
+        extend self
+
+        def start!
+          @log = []
+          @manifests = {}
+          @repo_rows = []
+          @asset_rows = { script: [], data: [] }
+          @selected = { script: nil, data: nil } # [name, repo] pairs
+          @loaded = false
+          done_queue = Queue.new
+
+        UI.page('browser', title: 'Jinx Package Manager') do |ui|
+          ui.header 'Jinx Package Manager'
+          initial_load unless @loaded
+
+          ui.tabs(%w[Scripts Data Repos Log]) do |scripts_tab, data_tab, repos_tab, log_tab|
+            [[scripts_tab, :script], [data_tab, :data]].each do |tab, kind|
+              build_assets_tab(tab, kind, ui)
+            end
+            build_repos_tab(repos_tab, ui)
+            log_tab.text 'Nothing logged yet.' if @log.empty?
+            @log.last(100).reverse_each { |line| log_tab.text line }
+          end
+
+          ui.divider
+          ui.button('Close', key: :close) { done_queue << true }
+        end
+
+          respond "--- jinx: package manager ready - open it with #{$clean_lich_char}ui#{" (#{UI.url}#/jinx/browser)" if UI.url}"
+          begin
+            done_queue.pop
+          ensure
+            UI.remove('browser')
+          end
+          Log.out('WebUI closed', label: %i(jinx webgui))
+        end
+
+        private
+
+        def wlog(message)
+          @log << "[#{Time.now.strftime('%H:%M:%S')}] #{message}"
+          @log.shift while @log.length > 200
+          UI.refresh('browser')
+        end
+
+        def initial_load
+          @loaded = true
+          wlog('Loading repository data, this may take 20-30 seconds...')
+          Thread.new do
+            refresh_everything
+          rescue StandardError => e
+            wlog("Initial load failed: #{e.message}")
+          end
+        end
+
+        def refresh_everything
+          repos = begin; Repo.to_a; rescue StandardError; []; end
+          rows = []
+          repos.each do |repo|
+            name, url, status = repo[:name].to_s, repo[:url].to_s, 'ok'
+            begin
+              @manifests[name] = GUI.manifest_with_retries(repo)
+            rescue StandardError => e
+              status = "error: #{e.message}"
+              wlog("Failed to fetch manifest for #{name}: #{e.message}")
+            end
+            rows << [name, url, status]
+          end
+          @repo_rows = rows.sort_by { |row| row[0] }
+          rebuild_assets(:script)
+          rebuild_assets(:data)
+          wlog("Loaded #{@repo_rows.length} repositories")
+        end
+
+        def rebuild_assets(kind)
+          rows = []
+          @manifests.each_value do |manifest|
+            assets = (kind == :script) ? GUI.safe_repo_scripts(manifest) : GUI.safe_repo_data(manifest)
+            assets.each do |asset|
+              fname = File.basename(CGI.unescape(asset[:file].to_s))
+              next if fname.empty?
+              rows << [fname, manifest[:name].to_s,
+                       GUI.installed_status(kind, fname),
+                       GUI.modified_status(kind, fname, asset),
+                       GUI.safe_ago(asset[:last_commit])]
+            end
+          end
+          @asset_rows[kind] = rows
+          UI.refresh('browser')
+        end
+
+        def filtered_rows(kind, filter)
+          rows = @asset_rows[kind]
+          return rows if filter.to_s.strip.empty?
+          pattern = Regexp.new(Regexp.escape(filter.strip), Regexp::IGNORECASE)
+          rows.select { |row| row[0] =~ pattern }
+        end
+
+        def build_assets_tab(tab, kind, ui)
+          filter_key = :"filter_#{kind}"
+          force_key = :"force_#{kind}"
+          info_key = :"info_#{kind}"
+
+          tab.text_input('Search', value: ui.state[filter_key], placeholder: 'filter by name (empty = all)',
+                         key: "search_#{kind}") { |v| ui.state[filter_key] = v }
+
+          rows = filtered_rows(kind, ui.state[filter_key])
+          selected_pair = @selected[kind]
+          selected_index = selected_pair && rows.index { |row| [row[0], row[1]] == selected_pair }
+          tab.text "#{rows.length} #{kind}(s)#{@loaded ? '' : ' - loading...'}"
+          tab.table(rows, headings: ['Name', 'Repo', 'Installed', 'Modified', 'Updated (ago)'],
+                    sortable: true, selected: selected_index, key: "table_#{kind}") { |index|
+            row = filtered_rows(kind, ui.state[filter_key])[index]
+            @selected[kind] = row ? [row[0], row[1]] : nil
+          }
+
+          tab.columns(4, compact: true, key: "actions_#{kind}") do |c_info, c_install, c_update, c_force|
+            c_info.button('Info', key: "info_#{kind}") { fetch_info(kind, ui, info_key) }
+            c_install.button('Install', key: "install_#{kind}") { run_asset_action(kind, ui, :install) }
+            c_update.button('Update', key: "update_#{kind}") { run_asset_action(kind, ui, :update) }
+            c_force.checkbox('Force overwrite', checked: ui.state[force_key], key: "force_#{kind}") { |v| ui.state[force_key] = v }
+          end
+
+          if ui.state[info_key]
+            tab.divider
+            ui.state[info_key].to_s.split("\n").each { |line| tab.text line }
+          end
+        end
+
+        def build_repos_tab(tab, ui)
+          selected_index = ui.state[:repo_selected] && @repo_rows.index { |row| row[0] == ui.state[:repo_selected] }
+          tab.table(@repo_rows, headings: %w[Name URL Status], sortable: true,
+                    selected: selected_index, key: 'repo_table') { |index|
+            ui.state[:repo_selected] = @repo_rows[index] && @repo_rows[index][0]
+          }
+          tab.text_input('Name', value: ui.state[:repo_name], placeholder: 'repo name', key: :repo_name) { |v| ui.state[:repo_name] = v.strip }
+          tab.text_input('URL', value: ui.state[:repo_url], placeholder: 'https://...', key: :repo_url) { |v| ui.state[:repo_url] = v.strip }
+          tab.columns(4, compact: true, key: 'repo_actions') do |c_add, c_rm, c_chg, c_refresh|
+            c_add.button('Add', key: :repo_add) {
+              name, url = ui.state[:repo_name].to_s, ui.state[:repo_url].to_s
+              run_repo_action("add #{name}") { CLI.repo_add(name, url) } unless name.empty? || url.empty?
+            }
+            c_rm.button('Remove selected', variant: :danger, key: :repo_rm) {
+              repo = ui.state[:repo_selected].to_s
+              run_repo_action("remove #{repo}") { CLI.repo_rm(repo) } unless repo.empty?
+            }
+            c_chg.button('Change URL of selected', key: :repo_chg) {
+              repo, url = ui.state[:repo_selected].to_s, ui.state[:repo_url].to_s
+              run_repo_action("change #{repo}") { CLI.repo_change(repo, url) } unless repo.empty? || url.empty?
+            }
+            c_refresh.button('Refresh manifests', key: :repo_refresh) {
+              wlog('Refreshing repositories...')
+              Thread.new {
+                begin
+                  @manifests.clear
+                  refresh_everything
+                rescue StandardError => e
+                  wlog("refresh: #{e.message}")
+                end
+              }
+            }
+          end
+        end
+
+        def run_repo_action(label, &action)
+          wlog("repo #{label}...")
+          Thread.new do
+            begin
+              action.call
+            rescue StandardError => e
+              wlog("repo #{label}: #{e.message}")
+            ensure
+              begin
+                @manifests.clear
+                refresh_everything
+              rescue StandardError => e
+                wlog("refresh: #{e.message}")
+              end
+            end
+          end
+        end
+
+        def run_asset_action(kind, ui, verb)
+          pair = @selected[kind]
+          return wlog("No #{kind} selected for #{verb}") unless pair
+
+          name, repo = pair
+          force = !!ui.state[:"force_#{kind}"]
+          wlog("#{verb} #{name} from #{repo}#{force ? ' (force)' : ''}...")
+          Thread.new do
+            begin
+              case [kind, verb]
+              when [:script, :install] then CLI.script_install(name, repo, force: force)
+              when [:script, :update]  then CLI.script_update(name, repo, force: force)
+              when [:data, :install]   then CLI.data_install(name, repo, force: force)
+              when [:data, :update]    then CLI.data_update(name, repo, force: force)
+              end
+              wlog("#{verb} #{name}: done")
+            rescue StandardError => e
+              wlog("#{verb} #{name}: #{e.message}")
+            ensure
+              rebuild_assets(kind)
+            end
+          end
+        end
+
+        # Captures Jinx::Log output from CLI.*_info the same way the GTK GUI
+        # does: briefly swap the Log constant for a collector.
+        def fetch_info(kind, ui, info_key)
+          pair = @selected[kind]
+          return wlog("No #{kind} selected") unless pair
+
+          name, repo = pair
+          ui.state[info_key] = "Fetching info for #{name}..."
+          Thread.new do
+            captured = []
+            capture_logger = Object.new
+            capture_logger.define_singleton_method(:mono) { |text| captured << text.to_s.gsub(/<[^>]+>/, ''); nil }
+            original_log = ::Lich::Common::Jinx::Log
+            begin
+              ::Lich::Common::Jinx.send(:remove_const, :Log)
+              ::Lich::Common::Jinx.const_set(:Log, capture_logger)
+              (kind == :script) ? CLI.script_info(name, repo) : CLI.data_info(name, repo)
+            rescue StandardError => e
+              captured << "Error: #{e.message}"
+            ensure
+              ::Lich::Common::Jinx.send(:remove_const, :Log)
+              ::Lich::Common::Jinx.const_set(:Log, original_log)
+            end
+            ui.state[info_key] = captured.any? ? captured.join("\n") : 'No info available'
+            UI.refresh('browser')
+          end
+        end
+      end
+
       module GUI
         extend self
 

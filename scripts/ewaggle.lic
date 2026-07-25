@@ -8,10 +8,18 @@
           game: gs
           tags: magic, utility, spell
       required: Lich >= 5.9.0
-       version: 2.1.6
+       version: 2.2.1
 
   Version Control:
     Major_change.feature_addition.bugfix
+  2.2.1 (2026-07-06)
+    Setup page density: casting-order and not-cast rows are compact
+    (name + small buttons together, tight stacking) instead of one
+    page-wide row per spell.
+  2.2.0 (2026-07-06)
+    - ;ewaggle setup renders in the browser via the Lich WebUI when enabled (;ui on):
+      casting order with up/down/remove controls, options gated by class/society,
+      Save & Close writes the profile. GTK window remains the fallback.
   2.1.6 (2026-06-16)
     - bugfix to cast 1612 first if in the cast list
   2.1.5 (2025-11-25)
@@ -191,6 +199,165 @@ module Ewaggle
         respond " Please visit https://gswiki.play.net/Cloak_of_Shadows_(712) for a complete list"
         @settings[:retribution_spell] = ""
       end
+    end
+  end
+end
+
+# Browser-based setup via the Lich WebUI (;ui). Mirrors the GTK Setup window:
+# a Spells tab managing the casting order, and an Options tab gated by
+# class/society knowledge. Changes accumulate in memory (like GTK) and write
+# to the profile when you press Save & Close.
+module Ewaggle
+  WEBUI_SETUP_DEFAULTS = {
+    not_to_cast: [], cast_list: [],
+    start_at: 180, stop_at: 180, refreshable_min: 15, armor_min: 15,
+    use_multicast: true, use_wracking: false, wander_to_wrack: false,
+    use_power: false, use_mana: false, use_concentration: false,
+    skip_not_sharing: false, skip_short_spells: false, bail_no_mana: false,
+    reserve_mana: 0, retribution_spell: "", use_203: false, use_515: false,
+    sonic_weapon: "", sonic_shield: "", sonic_armor: "", debug: false
+  }.freeze
+
+  WEBUI_RETRIBUTION_SPELLS = [
+    '701', '702', '703', '705', '706', '708', '711', '713', '715', '716', '717', '718', '719', '740',
+    '102', '106', '110', '111', '118', '119', '130',
+    '409', '412', '413', '415', '417'
+  ].freeze
+
+  # Rebuilds settings[:not_to_cast] from the character's known spells, the
+  # same way Setup#reset_no_cast does for the GTK window.
+  def self.rebuild_not_to_cast(settings)
+    settings[:not_to_cast] = []
+    settings[:cast_list].reject! do |entry|
+      number = entry[/^\d+/].to_i
+      if entry =~ /armor/i && entry !~ /sonic|mage/i
+        !Armor.known?(entry.gsub(/^\d+\s*/, ''))
+      else
+        !Spell[number].known?
+      end
+    end
+
+    known = []
+    Spell.list.each { |spell| known.push(spell) if (spell.known? && spell.time_per > 0 && spell.num.to_s =~ /(?:[1-4][0-9]|50|0[1-9])$/) }
+    known.push(Spell[511]) if Spell[511].known?
+    known.sort_by!(&:num)
+    known.each do |spell|
+      next if settings[:cast_list].include?("#{spell.num}  #{spell.name}")
+      settings[:not_to_cast] << "#{spell.num}  #{spell.name}"
+    end
+
+    Ewaggle.armor_spells.each { |name, number|
+      next unless Armor.known?(name)
+      next if settings[:cast_list].any? { |word| word =~ /armor/i }
+      settings[:not_to_cast] << "#{number} #{name}"
+    }
+    settings[:not_to_cast].uniq!
+  end
+
+  def self.webui_setup
+    settings = Ewaggle.data.settings
+    WEBUI_SETUP_DEFAULTS.each { |key, value| settings[key] = (value.is_a?(Array) ? value.dup : value) if settings[key].nil? }
+    rebuild_not_to_cast(settings)
+    done_queue = Queue.new
+    set = proc { |key, value| settings[key] = value }
+
+    UI.page('setup', title: "Ewaggle Setup v#{get_script_version}") do |ui|
+      ui.header "Ewaggle Setup v#{get_script_version}"
+      ui.markdown 'Changes apply in memory as you make them and are written to your profile when you press **Save & Close**.'
+
+      ui.tabs(%w[Spells Options]) do |spells, options|
+        spells.header 'Casting order'
+        spells.text '(nothing selected to cast yet)' if settings[:cast_list].empty?
+        settings[:cast_list].each_with_index do |entry, index|
+          spells.columns(2, compact: true, key: "cast_#{entry}") do |main, actions|
+            main.text "#{index + 1}.  #{entry}"
+            actions.columns(3, compact: true, key: "castact_#{entry}") do |up, down, remove|
+              up.button('up', key: "up_#{entry}", disabled: index.zero?) {
+                i = settings[:cast_list].index(entry)
+                settings[:cast_list].insert(i - 1, settings[:cast_list].delete_at(i)) if i && i > 0
+              }
+              down.button('down', key: "down_#{entry}", disabled: index == settings[:cast_list].length - 1) {
+                i = settings[:cast_list].index(entry)
+                settings[:cast_list].insert(i + 1, settings[:cast_list].delete_at(i)) if i && i < settings[:cast_list].length - 1
+              }
+              remove.button('remove', variant: :danger, key: "rm_#{entry}") {
+                settings[:cast_list].delete(entry)
+                settings[:not_to_cast] << entry
+                settings[:not_to_cast] = settings[:not_to_cast].sort_by { |e| e[/^\d+/].to_i }
+              }
+            end
+          end
+        end
+
+        spells.divider
+        spells.header 'Known spells not being cast'
+        spells.text '(every known spell is in the casting order)' if settings[:not_to_cast].empty?
+        settings[:not_to_cast].each do |entry|
+          spells.columns(2, compact: true, key: "skip_#{entry}") do |main, actions|
+            main.text entry
+            actions.button('add', key: "add_#{entry}") {
+              settings[:not_to_cast].delete(entry)
+              settings[:cast_list] << entry
+            }
+          end
+        end
+
+        options.header 'General'
+        options.checkbox('Use Multicast', checked: settings[:use_multicast], key: :use_multicast) { |v| set.call(:use_multicast, v) }
+        options.checkbox('Skip Short Spells', checked: settings[:skip_short_spells], key: :skip_short) { |v| set.call(:skip_short_spells, v) }
+        options.checkbox('Bail if out of mana', checked: settings[:bail_no_mana], key: :bail) { |v| set.call(:bail_no_mana, v) }
+        options.checkbox('Skip targets not sharing', checked: settings[:skip_not_sharing], key: :skip_sharing) { |v| set.call(:skip_not_sharing, v) }
+        options.checkbox('Use 203', checked: settings[:use_203], key: :use_203) { |v| set.call(:use_203, v) } if Spell[203].known?
+        options.checkbox('Use 515', checked: settings[:use_515], key: :use_515) { |v| set.call(:use_515, v) } if Spell[515].known?
+
+        if Society.member == 'Council of Light' && Society.rank >= 18
+          options.checkbox('Use Wracking', checked: settings[:use_wracking], key: :wracking) { |v| set.call(:use_wracking, v) }
+          options.checkbox('Wander to Wrack', checked: settings[:wander_to_wrack], key: :wander) { |v| set.call(:wander_to_wrack, v) }
+        elsif Society.member == 'Guardians of Sunfist'
+          options.checkbox('Use Power', checked: settings[:use_power], key: :power) { |v| set.call(:use_power, v) } if Society.rank >= 18
+          options.checkbox('Use Concentration', checked: settings[:use_concentration], key: :concentration) { |v| set.call(:use_concentration, v) } if Society.rank >= 14
+        elsif Society.member == 'Order of Voln' && Society.rank >= 13
+          options.checkbox('Use Symbol of Mana', checked: settings[:use_mana], key: :symbol_mana) { |v| set.call(:use_mana, v) }
+        end
+
+        options.divider
+        options.header 'Timing and mana'
+        options.slider('Start casting at (duration)', min: 0, max: 250, value: settings[:start_at].to_i, key: :start_at) { |v| set.call(:start_at, v.to_i) }
+        options.slider('Stop casting at (duration)', min: 0, max: 250, value: settings[:stop_at].to_i, key: :stop_at) { |v| set.call(:stop_at, v.to_i) }
+        options.slider('Refreshable minimum', min: 0, max: 250, value: settings[:refreshable_min].to_i, key: :refresh_min) { |v| set.call(:refreshable_min, v.to_i) }
+        options.slider('Armor minimum', min: 0, max: 410, value: settings[:armor_min].to_i, key: :armor_min) { |v| set.call(:armor_min, v.to_i) }
+        options.slider('Reserve mana', min: 0, max: 1000, value: settings[:reserve_mana].to_i, key: :reserve) { |v| set.call(:reserve_mana, v.to_i) }
+
+        if Spell[712].known?
+          options.divider
+          retribution = settings[:retribution_spell].to_s
+          retribution = 'none' if retribution.empty?
+          options.select('Retribution spell (712)', options: ['none'] + WEBUI_RETRIBUTION_SPELLS, value: retribution, key: :retribution) { |v|
+            set.call(:retribution_spell, v == 'none' ? '' : v)
+          }
+        end
+
+        if Spell[1012].known? || Spell[1009].known? || Spell[1014].known?
+          options.divider
+          options.header 'Sonic gear'
+          options.text_input('Sonic Weapon', value: settings[:sonic_weapon].to_s, key: :sonic_weapon) { |v| set.call(:sonic_weapon, v.strip) } if Spell[1012].known?
+          options.text_input('Sonic Shield', value: settings[:sonic_shield].to_s, key: :sonic_shield) { |v| set.call(:sonic_shield, v.strip) } if Spell[1009].known?
+          options.text_input('Sonic Armor', value: settings[:sonic_armor].to_s, key: :sonic_armor) { |v| set.call(:sonic_armor, v.strip) } if Spell[1014].known?
+        end
+      end
+
+      ui.divider
+      ui.button('Save & Close', key: :save_close) {
+        Ewaggle.save_profile
+        done_queue << true
+      }
+    end
+
+    respond "--- ewaggle: setup page ready - open it with #{$clean_lich_char}ui#{" (#{UI.url}#/ewaggle/setup)" if UI.url}"
+    begin
+      done_queue.pop
+    ensure
+      UI.remove('setup')
     end
   end
 end
@@ -1760,13 +1927,16 @@ module Ewaggle
   when /^load$/i
     Ewaggle.load(Ewaggle.load_profile())
   when /^setup$/i
-    if defined?(Gtk)
+    if defined?(UI) && UI.available?
+      Ewaggle.webui_setup
+      Ewaggle.load(Ewaggle.load_profile)
+    elsif defined?(Gtk)
       Ewaggle::Setup.new(Ewaggle.data.settings).start
       Ewaggle.load(Ewaggle.load_profile)
     else
       respond
       Lich::Messaging.msg('plain', 'GTK bindings are not installed or failed to load.')
-      Lich::Messaging.msg('plain', "For command-line setup, see #{$clean_lich_char}#{Script.current.name} help")
+      Lich::Messaging.msg('plain', "Enable the browser UI with #{$clean_lich_char}ui on, or for command-line setup see #{$clean_lich_char}#{Script.current.name} help")
       respond
     end
   when /^help$/i
