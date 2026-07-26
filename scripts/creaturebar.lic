@@ -9,9 +9,11 @@
       required: Lich >= 5.13.0
 
   Change Log:
-  v1.1 (2025/12/21)
-    - Alt + drag to move window around
-    - Warning if combat tracking disabled
+  v1.1 (2026/07/07)
+    - ;creaturebar web: WebUI panel mode (no GTK needed) - the same creature
+      data as a compact page a frontend can dock (VellumFE), a browser can
+      float, or Wrayth can show via ;ui bridge. Name + status letters,
+      HP bar, wounds summary, click-to-target. Silhouette art stays GTK-only.
   v1.0 (2025/11/30)
     - Shows current target (XMLData.current_target_id)
     - Visual injury doll with wound overlays
@@ -23,14 +25,22 @@
 
 =end
 
-require 'gtk3'
+begin
+  require 'gtk3'
+rescue LoadError
+  # GTK is only needed for the classic window; ;creaturebar web runs without it
+end
 require 'yaml'
 require 'fileutils'
 require File.join(LIB_DIR, 'common', 'db_store.rb')
-load(File.join(SCRIPT_DIR, 'jinx.lic'))
+begin
+  load(File.join(SCRIPT_DIR, 'jinx.lic'))
+rescue LoadError, StandardError
+  # Jinx not installed; AssetManager.ensure_jinx_available reports this to the user
+end
 
 module CreatureBar
-  VERSION = '1.0.0'
+  VERSION = '1.1.0'
 
   CONFIG_DIR = File.join(DATA_DIR, 'creature_bar')
   CONFIG_FILE = File.join(CONFIG_DIR, 'config.yaml')
@@ -39,14 +49,14 @@ module CreatureBar
   # Default configuration with all colors
   # Global settings shared across all characters (saved to config.yaml)
   DEFAULT_GLOBAL_CONFIG = {
-    'update_interval'  => 250,
-    'window'           => {
+    'update_interval' => 250,
+    'window'          => {
       'decorated'     => true,
       'always_on_top' => true,
       'transparent'   => false,
     },
     'silhouette_style' => 'greyscale', # 'greyscale' (grayscale, tintable) or 'color' (full artwork)
-    'colors'           => {
+    'colors'          => {
       # Window
       'window_background'     => 'rgba(46, 46, 46, 0.95)',
       # Name label
@@ -68,7 +78,7 @@ module CreatureBar
       'wound_rank2_tint'      => '#FFA500', # Orange - moderate wounds
       'wound_rank3_tint'      => '#FF0000'  # Red - severe wounds
     },
-    'status_effects'   => [
+    'status_effects'  => [
       { 'name' => 'stunned', 'symbol' => 'S', 'color' => '#FFD700' },
       { 'name' => 'immobilized', 'symbol' => 'I', 'color' => '#FF69B4' },
       { 'name' => 'webbed', 'symbol' => 'W', 'color' => '#C0C0C0' },
@@ -80,7 +90,7 @@ module CreatureBar
       { 'name' => 'dead', 'symbol' => 'D', 'color' => '#000000' },
       { 'name' => 'bleeding', 'symbol' => 'X', 'color' => '#DC143C' }
     ],
-    'wound_markers'    => {
+    'wound_markers'   => {
       'opacity' => 0.9
     }
     # Note: hp_bar, status, and name_display are per-silhouette settings
@@ -90,15 +100,15 @@ module CreatureBar
 
   # Character-specific settings (saved to DB_Store per character)
   DEFAULT_CHARACTER_CONFIG = {
-    'position'       => { 'x' => 100, 'y' => 100 },
-    'window'         => {
-      'width'  => 100,
-      'height' => 175,
+    'position'        => { 'x' => 100, 'y' => 100 },
+    'window'          => {
+      'width'         => 100,
+      'height'        => 175,
     },
-    'multi_creature' => {
+    'multi_creature'  => {
       'max_shown' => 5 # Maximum creatures to show: 1 = single panel mode, >1 = multi-panel mode
     },
-    'layout'         => {
+    'layout'          => {
       'mode'        => 'horizontal', # 'vertical' or 'horizontal' - controls multi-creature panel arrangement
       'max_rows'    => 2, # Maximum rows before wrapping to next column (vertical mode)
       'max_columns' => 5 # Maximum columns before wrapping to next row (horizontal mode)
@@ -122,7 +132,8 @@ module CreatureBar
   # Helper method to get user input without sending to game
   # Uses UpstreamHook to intercept valid menu responses (y/n, numbers, cancel)
   # Other commands pass through to the game normally
-  def self.get_user_input(valid_pattern = /^(?:<c>)?(a|y|n|yes|no|\d+|cancel)$/i)
+  # Returns nil if no valid input arrives within the timeout
+  def self.get_user_input(valid_pattern = /^(?:<c>)?(a|y|n|yes|no|\d+|cancel)$/i, timeout: 300)
     hook_name = "creaturebar_input_#{Time.now.to_i}"
     input_buffer = []
 
@@ -135,18 +146,23 @@ module CreatureBar
       end
     }
     UpstreamHook.add(hook_name, action)
-    # Wait for input to appear in buffer
-    sleep 0.1 while input_buffer.empty?
-    result = input_buffer.shift.gsub(/^<c>/, '')
+    deadline = Time.now + timeout
+    sleep 0.1 while input_buffer.empty? && Time.now < deadline
+
+    if input_buffer.empty?
+      respond "[CreatureBar] Timed out waiting for input."
+      nil
+    else
+      input_buffer.shift.gsub(/^<c>/, '')
+    end
+  ensure
     UpstreamHook.remove(hook_name)
-    result
   end
 
   @@window = nil
   @@config = nil
   @@update_timer = nil
   @@save_timer = nil
-  @@last_target_id = nil
   @@active_dialog = nil
   @@main_box = nil
   @@creature_panels = {} # Hash of creature_id => panel widgets for multi-creature mode
@@ -261,7 +277,7 @@ module CreatureBar
             version = $2.to_i
           else
             base_name = short_name
-            version = 0 # No version suffix = version 0 (older than v1)
+            version = 0  # No version suffix = version 0 (older than v1)
           end
 
           packages[short_name] ||= { assets: [], count: 0, base: base_name, version: version }
@@ -336,6 +352,10 @@ module CreatureBar
         respond "Enter choice (1-#{sorted_packages.size}, A for all), or 'cancel' to exit:"
 
         input = CreatureBar.get_user_input
+        unless input
+          respond "Setup cancelled. Run ;creaturebar again when ready."
+          return false
+        end
 
         case input.downcase
         when 'a', 'all'
@@ -406,54 +426,44 @@ module CreatureBar
         folder_name.sub(/_v\d+$/, '')
       end
 
+      # Map a remote manifest path to its local install directory.
+      # Remote structure:
+      # - assets/silhouettes/{style}/{region}/{family}.png
+      # - assets/silhouettes/default.png (root files)
+      # - assets/configs/{style}/{region}/{family}.yaml
+      # - assets/configs/default.yaml (root files)
+      # Returns the local target directory, or nil for unrecognized paths.
+      def local_target_dir(remote_path)
+        path_parts = remote_path.split('/')
+
+        if remote_path.include?('/silhouettes/')
+          base_dir = SILHOUETTE_DIR
+          idx = path_parts.index('silhouettes')
+        elsif remote_path.include?('/configs/')
+          base_dir = SILHOUETTE_CONFIG_DIR
+          idx = path_parts.index('configs')
+        else
+          return nil
+        end
+
+        if idx && path_parts.size > idx + 3
+          # Has style and region: silhouettes/color/atoll/valravn.png
+          style = path_parts[idx + 1]
+          region = path_parts[idx + 2]
+          File.join(base_dir, style, region)
+        elsif idx && path_parts.size == idx + 2
+          # Root file: silhouettes/default.png
+          base_dir
+        end
+      end
+
       def download_asset(repo, asset, overwrite: false)
         remote_path = asset[:file]
         filename = File.basename(remote_path)
 
-        # New structure for remote paths:
-        # - assets/silhouettes/color/region/family.png
-        # - assets/silhouettes/greyscale/region/family.png
-        # - assets/silhouettes/default.png (root files)
-        # - assets/configs/color/region/family.yaml
-        # - assets/configs/greyscale/region/family.yaml
-        # - assets/configs/default/default.yaml
-        path_parts = remote_path.split('/')
-
-        # Determine base directory and reconstruct path hierarchy
-        if remote_path.include?('/silhouettes/')
-          base_dir = SILHOUETTE_DIR
-          sil_idx = path_parts.index('silhouettes')
-
-          if sil_idx && path_parts.size > sil_idx + 3
-            # Has style and region: silhouettes/color/atoll/valravn.png
-            style = path_parts[sil_idx + 1]
-            region = path_parts[sil_idx + 2]
-            target_dir = File.join(base_dir, style, region)
-          elsif sil_idx && path_parts.size == sil_idx + 2
-            # Root file: silhouettes/default.png
-            target_dir = base_dir
-          else
-            respond "[CreatureBar] Unexpected silhouette path structure: #{remote_path}"
-            return false
-          end
-        elsif remote_path.include?('/configs/')
-          base_dir = SILHOUETTE_CONFIG_DIR
-          cfg_idx = path_parts.index('configs')
-
-          if cfg_idx && path_parts.size > cfg_idx + 3
-            # Has style and region: configs/color/atoll/valravn.yaml
-            style = path_parts[cfg_idx + 1]
-            region = path_parts[cfg_idx + 2]
-            target_dir = File.join(base_dir, style, region)
-          elsif cfg_idx && path_parts.size == cfg_idx + 2
-            # Root file: configs/default.yaml
-            target_dir = base_dir
-          else
-            respond "[CreatureBar] Unexpected config path structure: #{remote_path}"
-            return false
-          end
-        else
-          respond "[CreatureBar] Unknown asset type: #{remote_path}"
+        target_dir = local_target_dir(remote_path)
+        unless target_dir
+          respond "[CreatureBar] Unexpected asset path structure: #{remote_path}"
           return false
         end
 
@@ -493,16 +503,13 @@ module CreatureBar
           remote_path = asset[:file]
           remote_digest = asset[:md5]
 
-          # Determine local path based on asset type
-          if remote_path.include?('/silhouettes/')
-            filename = File.basename(remote_path)
-            local_path = File.join(SILHOUETTE_DIR, filename)
-          elsif remote_path.include?('/configs/')
-            filename = File.basename(remote_path)
-            local_path = File.join(SILHOUETTE_CONFIG_DIR, filename)
-          else
-            next
-          end
+          # Determine local path using the same mapping as download_asset
+          # (style/region assets install into subdirectories, not the root)
+          target_dir = local_target_dir(remote_path)
+          next unless target_dir
+
+          filename = File.basename(remote_path)
+          local_path = File.join(target_dir, filename)
 
           # Skip if file doesn't exist locally (not installed)
           next unless File.exist?(local_path)
@@ -546,15 +553,16 @@ module CreatureBar
 
       def needs_update?(local_path, remote_digest)
         return true unless File.exist?(local_path)
+        return true if remote_digest.nil?
 
         require 'digest'
 
-        # Jinx manifests supply MD5 digests; compare both hex and base64 forms
-        local_hex = Digest::MD5.file(local_path).hexdigest
-        local_b64 = [[local_hex].pack('H*')].pack('m0')
+        # The manifest's 'md5' field actually holds SHA1 digests (see
+        # scripts/generate_manifest.rb); compare both base64 and hex forms
+        local_b64 = Digest::SHA1.file(local_path).base64digest
+        local_hex = Digest::SHA1.file(local_path).hexdigest
 
-        return true if remote_digest.nil?
-        remote_digest != local_hex && remote_digest != local_b64
+        remote_digest != local_b64 && remote_digest != local_hex
       end
 
       def clear_assets
@@ -576,29 +584,25 @@ module CreatureBar
         backup_dir = File.join(CONFIG_DIR, "backup_#{timestamp}")
         FileUtils.mkdir_p(backup_dir)
 
-        # Backup and delete silhouettes
-        if Dir.exist?(SILHOUETTE_DIR)
-          silhouette_backup = File.join(backup_dir, 'silhouettes')
-          FileUtils.mkdir_p(silhouette_backup)
+        # Back up and delete files recursively, preserving the style/region
+        # subdirectory layout inside the backup
+        backup_and_clear = proc do |source_dir, backup_name, glob_pattern|
+          next unless Dir.exist?(source_dir)
 
-          Dir.glob(File.join(SILHOUETTE_DIR, '*.png')).each do |f|
-            FileUtils.cp(f, silhouette_backup) rescue nil
+          Dir.glob(File.join(source_dir, '**', glob_pattern)).each do |f|
+            rel = f[source_dir.length..].to_s.sub(%r{^[/\\]}, '')
+            dest_dir = File.join(backup_dir, backup_name, File.dirname(rel))
+            FileUtils.mkdir_p(dest_dir) rescue nil
+            FileUtils.cp(f, dest_dir) rescue nil
             File.delete(f) rescue nil
           end
-          respond "Backed up and cleared silhouettes."
         end
 
-        # Backup and delete configs
-        if Dir.exist?(SILHOUETTE_CONFIG_DIR)
-          config_backup = File.join(backup_dir, 'silhouette_configs')
-          FileUtils.mkdir_p(config_backup)
+        backup_and_clear.call(SILHOUETTE_DIR, 'silhouettes', '*.png')
+        respond "Backed up and cleared silhouettes."
 
-          Dir.glob(File.join(SILHOUETTE_CONFIG_DIR, '*.yaml')).each do |f|
-            FileUtils.cp(f, config_backup) rescue nil
-            File.delete(f) rescue nil
-          end
-          respond "Backed up and cleared silhouette configs."
-        end
+        backup_and_clear.call(SILHOUETTE_CONFIG_DIR, 'configs', '*.yaml')
+        respond "Backed up and cleared silhouette configs."
 
         respond ""
         respond "Backup saved to: #{backup_dir}"
@@ -610,6 +614,16 @@ module CreatureBar
 
   class << self
     # -- Configuration & persistence ----------------------------------------------------------
+    # Load YAML without allowing arbitrary object deserialization
+    # (configs may be downloaded from the asset repository)
+    def load_yaml_file(path)
+      if YAML.respond_to?(:safe_load_file)
+        YAML.safe_load_file(path, aliases: true)
+      else
+        YAML.load_file(path)
+      end
+    end
+
     def load_config
       # Load global settings from YAML
       global = load_global_config
@@ -638,7 +652,7 @@ module CreatureBar
       # Handle migration from old unified config.yaml format
       if File.exist?(CONFIG_FILE)
         begin
-          saved_config = YAML.load_file(CONFIG_FILE)
+          saved_config = load_yaml_file(CONFIG_FILE)
           if saved_config.is_a?(Hash)
             # If old config has character-specific settings, migrate them
             if saved_config['position'] || (saved_config['window'] && (saved_config['window']['width'] || saved_config['window']['height']))
@@ -688,6 +702,8 @@ module CreatureBar
       global['colors'] = config['colors'].dup if config['colors']
       global['status_effects'] = config['status_effects'].map(&:dup) if config['status_effects']
       global['wound_markers'] = config['wound_markers'].dup if config['wound_markers']
+      # Preserve the calibrator's saved window position (written by calibrate_creaturebar)
+      global['calibrator'] = config['calibrator'].dup if config['calibrator']
 
       global
     end
@@ -712,14 +728,16 @@ module CreatureBar
     # Load global config from YAML file
     def load_global_config
       if File.exist?(CONFIG_FILE)
-        saved = YAML.load_file(CONFIG_FILE)
+        saved = load_yaml_file(CONFIG_FILE)
+        saved = {} unless saved.is_a?(Hash)
         DEFAULT_GLOBAL_CONFIG.dup.tap do |global|
-          global.merge!(saved) if saved.is_a?(Hash)
+          global.merge!(saved)
           # Deep merge nested hashes
           global['window'] = DEFAULT_GLOBAL_CONFIG['window'].merge(saved['window'] || {})
           global['colors'] = DEFAULT_GLOBAL_CONFIG['colors'].merge(saved['colors'] || {})
           global['wound_markers'] = DEFAULT_GLOBAL_CONFIG['wound_markers'].merge(saved['wound_markers'] || {})
-          global['status_effects'] = saved['status_effects'] || DEFAULT_GLOBAL_CONFIG['status_effects']
+          # dup so later edits via the settings dialog can't mutate the frozen defaults
+          global['status_effects'] = (saved['status_effects'] || DEFAULT_GLOBAL_CONFIG['status_effects']).map(&:dup)
         end
       else
         DEFAULT_GLOBAL_CONFIG.dup.tap do |global|
@@ -757,7 +775,8 @@ module CreatureBar
       @@save_timer.kill if @@save_timer
       @@save_timer = Thread.new do
         sleep 1
-        save_window_settings # Capture current position/size before saving
+        # save_window_settings reads window geometry, so it must run on the GTK thread
+        Gtk.queue { save_window_settings }
         @@save_timer = nil
       end
     end
@@ -912,14 +931,10 @@ module CreatureBar
 
       menu.show_all
 
-      # Right-click to show menu, Alt+left-click to move window
+      # Right-click to show menu
       @@window.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
       @@window.signal_connect('button-press-event') do |_, event|
-        if event.button == 1 && (event.state & Gdk::ModifierType::MOD1_MASK) != 0
-          # Alt+left-click: begin window drag
-          @@window.begin_move_drag(event.button, event.x_root.to_i, event.y_root.to_i, event.time)
-          true
-        elsif event.button == 3
+        if event.button == 3
           menu.popup_at_pointer(event)
           true
         else
@@ -1049,7 +1064,7 @@ module CreatureBar
 
       if config_path
         begin
-          config = YAML.load_file(config_path)
+          config = load_yaml_file(config_path)
           @@silhouette_configs[cache_key] = config
 
           # Debug: Show first few body part coords
@@ -1070,14 +1085,18 @@ module CreatureBar
         end
       end
 
-      # Ultimate fallback: use DEFAULT_CONFIG body_parts
+      # Ultimate fallback: minimal but COMPLETE config so panel creation
+      # never hits a missing name_display/hp_bar/status section
       respond "[CreatureBar] Using minimal fallback silhouette config for family '#{family}'" if $creature_bar_debug
       {
         'scale'        => 0.8,
         'panel_width'  => 100,
         'panel_height' => 220,
         'marker_size'  => 12,
-        'body_parts'   => {}
+        'body_parts'   => {},
+        'name_display' => { 'show' => true, 'mode' => 'noun', 'font_size' => 8, 'font_weight' => 'normal', 'max_length' => 15 },
+        'hp_bar'       => { 'show' => true, 'show_bar' => true, 'show_text' => false, 'text_style' => 'overlay', 'width' => 100, 'height' => 8 },
+        'status'       => { 'show' => true, 'font_size' => 8 }
       }
     end
 
@@ -1160,7 +1179,7 @@ module CreatureBar
         default_path = File.join(SILHOUETTE_DIR, 'default.png')
         if File.exist?(default_path)
           silhouette_path = default_path
-          actual_style = style # Use preferred style for config lookup
+          actual_style = style  # Use preferred style for config lookup
         end
       end
 
@@ -1226,8 +1245,8 @@ module CreatureBar
       style = @@config['silhouette_style'] || 'greyscale'
 
       # Find the actual silhouette to determine which style's config to use
-      _silhouette_path, actual_style = find_silhouette_file(family, style)
-      actual_style ||= style # Fall back to preferred style if not found
+      silhouette_path, actual_style = find_silhouette_file(family, style)
+      actual_style ||= style  # Fall back to preferred style if not found
 
       # Load style-specific config (e.g., atoll_color vs atoll_shadow configs differ)
       silhouette_config = load_silhouette_config(family, actual_style)
@@ -1254,13 +1273,14 @@ module CreatureBar
       # Store widgets for this panel
       panel_widgets = {}
 
-      # Merge display settings: silhouette config takes precedence, fall back to global config
+      # Merge display settings: silhouette config takes precedence, fall back to
+      # global config, then to safe defaults (a hand-edited YAML may omit sections)
       panel_widgets[:config] = {
         'panel_width'  => panel_width,
         'panel_height' => panel_height,
-        'name_display' => silhouette_config['name_display'] || @@config['name_display'],
-        'hp_bar'       => silhouette_config['hp_bar'] || @@config['hp_bar'],
-        'status'       => silhouette_config['status'] || @@config['status']
+        'name_display' => silhouette_config['name_display'] || @@config['name_display'] || { 'show' => true, 'mode' => 'noun', 'font_size' => 8, 'font_weight' => 'normal', 'max_length' => 15 },
+        'hp_bar'       => silhouette_config['hp_bar'] || @@config['hp_bar'] || { 'show' => true, 'show_bar' => true, 'show_text' => false, 'text_style' => 'overlay', 'width' => 100, 'height' => 8 },
+        'status'       => silhouette_config['status'] || @@config['status'] || { 'show' => true, 'font_size' => 8 }
       }
 
       # Name label with optional current target icon
@@ -1285,7 +1305,7 @@ module CreatureBar
         font_weight = name_config['font_weight'] || 'normal'
         color = @@config['colors']['name_font'] || '#FFFFFF'
 
-        markup = "<span size='#{font_size}' weight='#{font_weight}' color='#{color}'>#{display_name}</span>"
+        markup = "<span size='#{font_size}' weight='#{font_weight}' color='#{color}'>#{escape_markup(display_name)}</span>"
         name_label.set_markup(markup)
 
         panel_box.pack_start(name_label, expand: false, fill: false, padding: 0)
@@ -1614,10 +1634,6 @@ module CreatureBar
 
       notebook = Gtk::Notebook.new
 
-      # Track values that require a full recreate when changed
-      @@config.dig('window', 'transparent')
-      @@config.dig('window', 'decorated')
-
       # Store all widgets for later retrieval
       widgets = {}
 
@@ -1681,6 +1697,10 @@ module CreatureBar
       original_decorated = @@config.dig('window', 'decorated')
       pending_recreate = false
 
+      # Status effect Add/Edit/Delete mutate @@config immediately;
+      # snapshot so Cancel can revert unapplied changes
+      original_status_effects = @@config['status_effects'].map(&:dup)
+
       loop do
         response = dialog.run
 
@@ -1696,8 +1716,8 @@ module CreatureBar
 
           # Track original tint values to detect changes
           original_tints = {
-            'silhouette_tint'  => @@config.dig('colors', 'silhouette_tint'),
-            'markers_tint'     => @@config.dig('colors', 'markers_tint'),
+            'silhouette_tint' => @@config.dig('colors', 'silhouette_tint'),
+            'markers_tint' => @@config.dig('colors', 'markers_tint'),
             'wound_rank1_tint' => @@config.dig('colors', 'wound_rank1_tint'),
             'wound_rank2_tint' => @@config.dig('colors', 'wound_rank2_tint'),
             'wound_rank3_tint' => @@config.dig('colors', 'wound_rank3_tint')
@@ -1773,10 +1793,13 @@ module CreatureBar
           # Update originals for subsequent Apply runs
           original_transparent = @@config['window']['transparent']
           original_decorated = @@config['window']['decorated']
+          original_status_effects = @@config['status_effects'].map(&:dup)
 
           # Only break on OK (Apply keeps dialog open)
           break if response == Gtk::ResponseType::OK
         when Gtk::ResponseType::CANCEL, Gtk::ResponseType::DELETE_EVENT
+          # Revert status effect list changes that were never applied
+          @@config['status_effects'] = original_status_effects
           break
         end
       end
@@ -2282,7 +2305,6 @@ module CreatureBar
 
     def update_display
       targets = get_current_targets
-      _current_ids = targets.map { |t| t.id.to_i }.to_set
 
       if $creature_bar_debug && !targets.empty?
         respond "[CreatureBar] update_multi_creature_display: #{targets.size} targets detected"
@@ -2581,7 +2603,7 @@ module CreatureBar
 
         # Only truncate for name mode (full names can be long)
         if name_mode == 'name'
-          max_length = panel[:config]['name_display']['max_length']
+          max_length = panel[:config]['name_display']['max_length'] || 15
           name = "#{name[0, max_length - 3]}..." if name.length > max_length
         end
 
@@ -2595,7 +2617,7 @@ module CreatureBar
           font_weight = name_config['font_weight'] || 'normal'
           color = @@config['colors']['name_font'] || '#FFFFFF'
 
-          markup = "<span size='#{font_size}' weight='#{font_weight}' color='#{color}'>#{name}</span>"
+          markup = "<span size='#{font_size}' weight='#{font_weight}' color='#{color}'>#{escape_markup(name)}</span>"
           panel[:name_label].set_markup(markup)
         end
       end
@@ -2741,7 +2763,7 @@ module CreatureBar
         status_parts = statuses.map do |status|
           abbrev = get_status_symbol(status)
           color = get_status_color(status)
-          "<span color='#{color}'>#{abbrev}</span>"
+          "<span color='#{color}'>#{escape_markup(abbrev)}</span>"
         end
 
         # Use font size and no brackets (matching calibrator)
@@ -2804,6 +2826,16 @@ module CreatureBar
     end
 
     # -- Shared helpers -----------------------------------------------------------------------
+    # Escape text for use inside Pango markup (creature names can contain & or <)
+    def escape_markup(text)
+      text = text.to_s
+      if GLib.respond_to?(:markup_escape_text)
+        GLib.markup_escape_text(text)
+      else
+        text.gsub('&', '&amp;').gsub('<', '&lt;').gsub('>', '&gt;')
+      end
+    end
+
     def build_hp_text(current_hp, max_hp, percentage, hp_config)
       return '' unless hp_config
 
@@ -2895,7 +2927,7 @@ module CreatureBar
       raw = surface.data
       pixels = raw.unpack('C*')
       (0...pixels.length).step(4) do |i|
-        pixels[i], pixels[i + 2] = pixels[i + 2], pixels[i] # Swap B and R
+        pixels[i], pixels[i + 2] = pixels[i + 2], pixels[i]  # Swap B and R
       end
       rgba_data = pixels.pack('C*')
 
@@ -2906,7 +2938,7 @@ module CreatureBar
         bits_per_sample: 8,
         width: width,
         height: height,
-        row_stride: width * 4 # RGBA = 4 bytes per pixel
+        row_stride: width * 4  # RGBA = 4 bytes per pixel
       )
     end
 
@@ -2980,11 +3012,19 @@ module CreatureBar
       @@save_timer = nil
 
       # Save window settings before any destruction (check destroyed state)
+      # Reading window geometry must happen on the GTK thread; the queue is
+      # FIFO, so this runs before the destroy queued below
       if @@window && !@@window.destroyed?
         begin
-          save_window_settings
+          Gtk.queue do
+            begin
+              save_window_settings
+            rescue StandardError
+              # Window may have been destroyed, ignore
+            end
+          end
         rescue StandardError
-          # Window may have been destroyed, ignore
+          # Ignore GTK errors during shutdown
         end
       end
 
@@ -3027,28 +3067,271 @@ module CreatureBar
   end
 end
 
+# Browser/FE panel via the Lich WebUI (;ui): the same creature data as the
+# GTK window, rendered as a compact page a frontend (VellumFE) can dock as
+# a chromeless panel, a browser can float, or Wrayth can show via
+# ;ui bridge. No silhouette art (browser tier keeps it glanceable): name,
+# HP bar, status letters, wounds summary, click-to-target.
+module CreatureBar
+  module WebPanel
+    extend self
+
+    MAX_SHOWN = 5
+    TICK = 0.25 # seconds between change checks
+
+    # Status letters colored from the WebUI's fixed {{color}} palette,
+    # mirroring DEFAULT_GLOBAL_CONFIG's status_effects table.
+    STATUS_COLORS = {
+      'stunned'     => 'yellow',
+      'immobilized' => 'magenta',
+      'webbed'      => 'gray',
+      'prone'       => 'orange',
+      'blind'       => 'orange',
+      'sunburst'    => 'yellow',
+      'sleeping'    => 'magenta',
+      'poisoned'    => 'green',
+      'dead'        => 'gray',
+      'bleeding'    => 'red'
+    }.freeze
+
+    WOUND_COLORS = { 1 => 'yellow', 2 => 'orange', 3 => 'red' }.freeze
+
+    # Blocks until the script dies or the shutdown block turns true,
+    # pushing a refresh whenever the tracked creatures change.
+    # Wound-marker colors as small solid overlay boxes on the silhouette.
+    WOUND_MARKER_KINDS = { 1 => 'wound1', 2 => 'wound2', 3 => 'wound3' }.freeze
+
+    def run(&shutdown)
+      # Serve the silhouette PNGs so image_map can reference them by URL.
+      # (No-op-safe if the dir is absent; render falls back to bars.)
+      UI.serve('cbsilhouettes', CreatureBar::SILHOUETTE_DIR) rescue nil
+      UI.page('main', title: "CreatureBar: #{XMLData.name}", bare: true, kind: :panel, size: [340, 220]) { |ui| render(ui) }
+      # Config page (the browser equivalent of the GTK "Settings..." dialog).
+      UI.page('config', title: 'CreatureBar Settings') { |ui| render_config(ui) }
+      respond "--- creaturebar: web panel ready - #{$clean_lich_char}ui open creaturebar/main (settings at creaturebar/config)"
+
+      last = nil
+      until shutdown&.call
+        snapshot = fingerprint
+        if snapshot != last
+          last = snapshot
+          UI.refresh('main')
+        end
+        sleep TICK
+      end
+    ensure
+      UI.remove('main')
+      UI.remove('config')
+    end
+
+    private
+
+    # Browser config page: the WebUI equivalent of the GTK Settings dialog.
+    # Edits write straight into CreatureBar's @@config and persist via
+    # save_config (debounced). Colors are hex strings (as GTK stores them);
+    # a text field is faithful and needs no color-picker primitive.
+    def render_config(ui)
+      cfg = CreatureBar.class_variable_get(:@@config) rescue {}
+      cfg ||= {}
+      save = proc { CreatureBar.save_config rescue nil }
+      # Nested-hash setter: dig_set(['layout','mode'], value)
+      dig_set = proc do |path, value|
+        node = cfg
+        path[0..-2].each { |k| node = (node[k] ||= {}) }
+        node[path[-1]] = value
+        save.call
+      end
+      color_field = proc do |section, label, key|
+        section.text_input(label, value: (cfg.dig('colors', key) || '').to_s, placeholder: '#rrggbb', key: "color_#{key}") { |v|
+          (cfg['colors'] ||= {})[key] = v.strip
+          save.call
+        }
+      end
+
+      ui.header 'CreatureBar Settings'
+      ui.markdown 'Changes save immediately. Colors are hex like `#e51616`.'
+
+      ui.tabs(%w[Layout HP\ Colors Status Window Tint Behavior]) do |layout, hp, status, window, tint, behavior|
+        # ----- Layout -----
+        layout.header 'Layout'
+        mode = (cfg.dig('layout', 'mode') || 'vertical').to_s.capitalize
+        layout.select('Mode', options: %w[Vertical Horizontal], value: mode, key: :layout_mode) { |v| dig_set.call(%w[layout mode], v.downcase) }
+        layout.number_input('Max columns', min: 1, max: 20, value: (cfg.dig('layout', 'max_columns') || 5).to_i, key: :max_columns) { |v| dig_set.call(%w[layout max_columns], v.to_i) }
+        layout.number_input('Max rows', min: 1, max: 20, value: (cfg.dig('layout', 'max_rows') || 5).to_i, key: :max_rows) { |v| dig_set.call(%w[layout max_rows], v.to_i) }
+        layout.number_input('Max creatures shown', min: 1, max: 20, value: (cfg.dig('multi_creature', 'max_shown') || 5).to_i, key: :max_shown) { |v| dig_set.call(%w[multi_creature max_shown], v.to_i) }
+
+        # ----- HP Colors -----
+        hp.header 'HP bar colors (hex)'
+        [['HP High', 'hp_high'], ['HP Mid', 'hp_mid'], ['HP Low', 'hp_low'], ['HP Background', 'hp_background'], ['HP Text', 'hp_text']].each { |lbl, key| color_field.call(hp, lbl, key) }
+
+        # ----- Status Colors (status_effects list) -----
+        status.header 'Status effects (symbol + color per status)'
+        effects = cfg['status_effects'].is_a?(Array) ? cfg['status_effects'] : []
+        status.text '(no status effects configured)' if effects.empty?
+        effects.each_with_index do |eff, i|
+          name = (eff['name'] || eff[:name] || "status #{i}").to_s
+          status.columns(3, key: "seff_#{i}") do |nm, sym, col|
+            nm.text name
+            sym.text_input('symbol', value: (eff['symbol'] || eff[:symbol] || '').to_s, key: "seff_sym_#{i}") { |v| eff['symbol'] = v; save.call }
+            col.text_input('color', value: (eff['color'] || eff[:color] || '').to_s, placeholder: '#rrggbb', key: "seff_col_#{i}") { |v| eff['color'] = v.strip; save.call }
+          end
+        end
+
+        # ----- Window Colors -----
+        window.header 'Window / border colors (hex)'
+        [['Current Target Border', 'current_target_border'], ['Other Target Border', 'other_target_border'], ['Name Font', 'name_font']].each { |lbl, key| color_field.call(window, lbl, key) }
+
+        # ----- Tint Colors -----
+        tint.header 'Tint colors (hex)'
+        [['Silhouette Tint', 'silhouette_tint'], ['Markers Tint', 'markers_tint']].each { |lbl, key| color_field.call(tint, lbl, key) }
+
+        # ----- Behavior -----
+        behavior.header 'Behavior'
+        sil_style = (cfg['silhouette_style'] || 'greyscale').to_s.capitalize
+        behavior.select('Silhouette style', options: %w[Greyscale Color], value: sil_style, key: :silhouette_style) { |v| cfg['silhouette_style'] = v.downcase; save.call }
+        behavior.number_input('Update interval (ms)', min: 100, max: 5000, step: 50, value: (cfg['update_interval'] || 250).to_i, key: :update_interval) { |v| cfg['update_interval'] = v.to_i; save.call }
+        behavior.text_input('Wound marker opacity (0.0-1.0)', value: (cfg.dig('wound_markers', 'opacity') || 1.0).to_s, key: :wound_opacity) { |v| dig_set.call(%w[wound_markers opacity], v.to_f.clamp(0.0, 1.0)) }
+      end
+    end
+
+    def render(ui)
+      targets = visible_targets
+      if targets.empty?
+        ui.markdown '{{gray:no targets}}'
+        return
+      end
+
+      current_id = XMLData.current_target_id.to_i rescue 0
+      targets.each do |target|
+        id = target.id.to_i
+        creature = Creature[id] rescue nil
+        render_creature(ui, target, creature, current: id == current_id)
+      end
+    end
+
+    def render_creature(ui, target, creature, current:)
+      id = target.id.to_i
+      name = target.name.to_s
+      title = current ? "{{yellow:**#{name}**}}" : "**#{name}**"
+      statuses = (creature&.statuses || []).map(&:to_s)
+      title = "{{gray:#{name}}}" if statuses.include?('dead')
+      letters = statuses.map { |status|
+        symbol = CreatureBar.get_status_symbol(status)
+        "{{#{STATUS_COLORS[status] || 'cyan'}:#{symbol}}}"
+      }.join(' ')
+
+      ui.columns(2, compact: true, key: "row_#{id}") do |main, actions|
+        main.markdown "#{title} #{letters}".strip
+        actions.button('target', key: "tgt_#{id}", disabled: current) { put "target ##{id}" }
+      end
+
+      # Silhouette artwork with wound-marker overlays (image_map), when
+      # silhouettes are installed; otherwise the HP bar below carries health.
+      render_silhouette(ui, id, creature)
+
+      if creature&.hp_percent
+        ui.progress(creature.hp_percent / 100.0, label: "#{creature.current_hp}/#{creature.max_hp} (#{creature.hp_percent.round}%)")
+      end
+
+      wounds = (creature&.injuries || {}).select { |_part, level| level.to_i.positive? }
+      unless wounds.empty?
+        summary = wounds.map { |part, level|
+          rank = [level.to_i, 3].min
+          "{{#{WOUND_COLORS[rank]}:#{part.to_s.tr('_', ' ')} #{rank}}}"
+        }.join(', ')
+        ui.markdown summary
+      end
+    end
+
+    # Render the creature's silhouette as an image_map, with a small colored
+    # box at each wounded body part. Uses the same family resolution and
+    # body-part coordinates as the GTK panel. Silently does nothing (bars
+    # carry the info) if silhouettes are not installed or the family is
+    # unknown - matching the GTK fallback.
+    def render_silhouette(ui, id, creature)
+      return unless creature
+      return unless CreatureBar.respond_to?(:silhouettes_installed?) && CreatureBar.silhouettes_installed? rescue return
+
+      family = CreatureBar.get_creature_family(creature) rescue nil
+      return unless family
+
+      style = (CreatureBar.instance_variable_get(:@@config) || {})['silhouette_style'] rescue nil
+      path, actual_style = CreatureBar.find_silhouette_file(family, style)
+      return unless path && File.exist?(path)
+
+      # Build the /files/ URL from the path relative to SILHOUETTE_DIR.
+      rel = path.sub(/\A#{Regexp.escape(CreatureBar::SILHOUETTE_DIR)}[\\\/]?/, '').tr('\\', '/')
+      src = "/files/cbsilhouettes/#{rel}"
+
+      config = CreatureBar.load_silhouette_config(family, actual_style) rescue {}
+      body_parts = config['body_parts'] || {}
+      scale = (config['scale'] || 1.0).to_f
+      msize = (config['marker_size'] || 12).to_i
+
+      wounds = (creature.injuries || {}).select { |_part, level| level.to_i.positive? }
+      markers = wounds.filter_map do |part, level|
+        coords = body_parts[part.to_s]
+        next unless coords
+
+        rank = [level.to_i, 3].min
+        x = (coords[0] * scale).round
+        y = (coords[1] * scale).round
+        { id: "#{id}_#{part}", x1: x, y1: y, x2: x + msize, y2: y + msize,
+          kind: WOUND_MARKER_KINDS[rank] }
+      end
+
+      ui.image_map(src, markers: markers, key: "sil_#{id}")
+    rescue StandardError => e
+      respond "[CreatureBar] web silhouette error: #{e.message}" if $creature_bar_debug
+    end
+
+    def visible_targets
+      GameObj.targets.select { |obj| obj.id && obj.id.to_i > 0 && obj.noun && obj.name }.first(MAX_SHOWN)
+    rescue StandardError
+      []
+    end
+
+    # Cheap change detector driving UI.refresh - covers target list,
+    # current target, hp, statuses, and wounds.
+    def fingerprint
+      current = XMLData.current_target_id.to_i rescue 0
+      rows = visible_targets.map { |target|
+        creature = Creature[target.id.to_i] rescue nil
+        [target.id, creature&.hp_percent, creature&.statuses&.sort, creature&.injuries&.dup]
+      }
+      [current, rows]
+    rescue StandardError
+      nil
+    end
+  end
+end
+
 # Script execution
 if Script.current.name.downcase == 'creaturebar'
-  begin
-    require 'gtk3'
-  rescue LoadError
-    echo "Error: GTK3 gem not found. Install with: gem install gtk3"
-    exit
-  end
-
   # Check if Creature module is available
   unless defined?(Creature)
     echo "Error: Creature module not found. Make sure creature.rb is loaded."
     exit
   end
 
-  # Check if Combat::Tracker is enabled (required for wound/HP/status tracking)
-  if defined?(Combat::Tracker) && !Combat::Tracker.enabled?
-    respond ""
-    respond "[CreatureBar] Warning: Combat::Tracker is not enabled."
-    respond "  Wounds, HP, and status effects will not update."
-    respond "  To enable: ;e Combat::Tracker.enable!"
-    respond ""
+  # Web panel mode: no GTK needed at all
+  if script.vars[1] =~ /^web$/i
+    unless defined?(UI) && UI.available?
+      respond "--- creaturebar: the WebUI is disabled. Enable it with #{$clean_lich_char}ui on, then rerun ;creaturebar web."
+      exit
+    end
+    web_shutdown = false
+    Signal.trap("INT") { web_shutdown = true }
+    Signal.trap("TERM") { web_shutdown = true }
+    CreatureBar::WebPanel.run { web_shutdown }
+    exit
+  end
+
+  begin
+    require 'gtk3'
+  rescue LoadError
+    echo "Error: GTK3 gem not found. Install with: gem install gtk3 (or use ;creaturebar web)"
+    exit
   end
 
   # Handle help command
@@ -3062,6 +3345,8 @@ if Script.current.name.downcase == 'creaturebar'
     respond ""
     respond " Commands:"
     respond "   (none)     Start CreatureBar"
+    respond "   web        WebUI panel instead of the GTK window (;ui on first;"
+    respond "              dockable in VellumFE, floatable in a browser, ;ui bridge in Wrayth)"
     respond "   config     Start with settings dialog open"
     respond "   download   Download/re-download asset packs"
     respond "   update     Check for and install asset updates"
@@ -3132,8 +3417,11 @@ if Script.current.name.downcase == 'creaturebar'
     CreatureBar.stop
   end
 
-  Signal.trap("INT") { CreatureBar.stop }
-  Signal.trap("TERM") { CreatureBar.stop }
+  # Trap handlers run in trap context where mutex/IO operations are restricted;
+  # just set a flag and let the keep-alive loop below do the actual shutdown
+  shutdown_requested = false
+  Signal.trap("INT") { shutdown_requested = true }
+  Signal.trap("TERM") { shutdown_requested = true }
 
   # Handle script arguments
   if script.vars[1] =~ /^config|^setup/i
@@ -3148,6 +3436,7 @@ if Script.current.name.downcase == 'creaturebar'
   script_name = Script.current.name
   loop do
     sleep 1
+    break if shutdown_requested
     break unless Script.running?(script_name) && CreatureBar.running?
   end
 
