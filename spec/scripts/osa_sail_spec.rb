@@ -38,6 +38,7 @@ RSpec.describe OsaSail do
       expect(OsaSail::Data.port_named('landing')).to eq("Wehnimer's Landing")
       expect(OsaSail::Data.port_named('grief')).to eq("Sailor's Grief")
       expect(OsaSail::Data.port_named('atlantis')).to be_nil
+      expect(OsaSail::Data.port_named('Isle of Ornath')).to eq('Sleeping Drake Harbor')
     end
 
     it 'maps a pier title back to its rooms and port' do
@@ -532,6 +533,22 @@ RSpec.describe OsaSail do
       expect(trip.send(:ship_object?, obj.new('war', "a man o' war"))).to be(true)
       expect(trip.send(:ship_object?, obj.new('man', 'a bustling man'))).to be(true)
       expect(trip.send(:ship_object?, obj.new('sloop', 'shadowy black mistwood sloop'))).to be(false)
+    end
+
+    it 'names the unknown port when SHIP INFO uses a name it does not know' do
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)')
+      allow(game).to receive(:quiet).and_return(['Ships you own:', 'SLOOP    Docked at: Atlantis'])
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect { trip.run }.to raise_error(OsaSail::Halt, /it says "Atlantis", which is not a port I know/)
+    end
+
+    it 'falls back to the pier it is standing on for the departure port' do
+      game = FakeGame.new(start_title: "[Kraken's Fall, Fourth Pier] (7118240)", ashore: true)
+      allow(game).to receive(:quiet).and_return(['Ships you own:', 'SLOOP    Docked at: Atlantis'])
+      allow(game).to receive(:current_uid).and_return(7_118_240)
+      trip = described_class.new(game, 'Solhaven', confirm: false)
+      expect { trip.run }.to raise_error(OsaSail::Halt) # walks to the handler, then the fake has no answer
+      expect(game.walks.first).to eq(OsaSail::Data::PORTS["Kraken's Fall"][:handler])
     end
 
     it 'halts when another ship of yours is already out at a different port' do

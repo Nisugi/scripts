@@ -2599,9 +2599,15 @@ module OsaSail
       "Forward Crow's Nest" => { 'Forward Deck' => 'down' }
     }.freeze
 
+    # Names SHIP INFO uses for a port when they differ from the port table's.
+    PORT_ALIASES = {
+      'isle of ornath' => 'Sleeping Drake Harbor'
+    }.freeze
+
     def self.port_named(text)
       return nil if text.nil? || text.strip.empty?
       want = text.strip.downcase
+      return PORT_ALIASES[want] if PORT_ALIASES.key?(want)
       PORTS.keys.find { |n| n.downcase == want } ||
         PORTS.keys.find { |n| n.downcase.start_with?(want) } ||
         PORTS.keys.find { |n| n.downcase.split(/[\s']+/).any? { |w| w.start_with?(want) } }
@@ -3060,8 +3066,12 @@ module OsaSail
     def run
       goal = Data::PORTS.fetch(@target)
       locate
-      departure = @docked_at
-      raise Halt, "SHIP INFO does not say which port your #{@hull} is docked at" unless departure
+      # SHIP INFO's port name, or failing that the port of the pier we are standing on.
+      departure = @docked_at || Data.port_of_pier(@game.current_uid)
+      unless departure
+        said = @docked_at_text ? " (it says #{@docked_at_text.inspect}, which is not a port I know)" : ''
+        raise Halt, "SHIP INFO does not say which port your #{@hull} is docked at#{said}"
+      end
       raise Halt, "your #{@hull} is already at #{@target}" if departure == @target
 
       legs = Course.plot(Data::PORTS.fetch(departure)[:uid], goal[:uid])
@@ -3116,7 +3126,8 @@ module OsaSail
         found = Deck.hull_by_name(m[1])
         next if @hull && found != @hull
         @hull ||= found
-        @docked_at = Data.port_named(Lines::DOCKED_AT.match(m[2])&.[](1))
+        @docked_at_text = Lines::DOCKED_AT.match(m[2])&.[](1)
+        @docked_at = Data.port_named(@docked_at_text)
       end
       return unless @hull
 
