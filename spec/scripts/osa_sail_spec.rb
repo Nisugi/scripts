@@ -459,6 +459,22 @@ RSpec.describe OsaSail do
       expect(described_class.wind_duration(912, 100)).to eq(90)
     end
 
+    it 'halts when another ship of yours is already out at a different port' do
+      game = FakeGame.new(start_title: "[Kraken's Fall, Deadeye's Road] (7118238)", ashore: true)
+      allow(game).to receive(:quiet).and_return(['Ships you own:', "MAN O' WAR    Docked at: Kraken's Fall", 'SLOOP    Docked at: Solhaven'])
+      allow(game).to receive(:send).and_wrap_original do |m, command, *rest, **kw|
+        if command.start_with?('ask #')
+          game.commands << command
+          %(Tarence exclaims, "What?  You already have a ship docked at the North 'Haven Quay, Green Pier!")
+        else
+          m.call(command, *rest, **kw)
+        end
+      end
+      trip = described_class.new(game, 'Solhaven', confirm: false, hull: "Man O' War")
+      expect { trip.run }.to raise_error(OsaSail::Halt, /already out at North 'Haven Quay, Green Pier \(Solhaven\); store it/)
+      expect(game.walks.size).to eq(1)
+    end
+
     it 'halts with directions when the handler sends you to the boatswain' do
       game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
       allow(game).to receive(:send).and_wrap_original do |m, command, *rest, **kw|

@@ -3114,7 +3114,7 @@ module OsaSail
       port = Data::PORTS.fetch(departure)
       raise Halt, "could not walk to the #{departure} dock handler" unless @game.walk_to(port[:handler])
 
-      pier = ask_handler
+      pier = ask_handler(departure)
       rooms = Data.piers_titled(pier)
       raise Halt, "the handler named #{pier.inspect}, which is not in the pier table" if rooms.empty?
 
@@ -3136,7 +3136,7 @@ module OsaSail
       board(noun)
     end
 
-    def ask_handler
+    def ask_handler(departure)
       npc = @game.npcs.find { |n| n.noun =~ /^(handler|master|warden)$/ && (n.name =~ /dock/ || n.noun == 'warden') }
       raise Halt, 'no dock handler here' unless npc
 
@@ -3145,7 +3145,14 @@ module OsaSail
         line = @game.send("ask ##{npc.id} about retrieve #{Data::HULLS.fetch(@hull)[:noun]}", answer, timeout: 6)
         raise Halt, 'the dock handler did not answer' unless line
         if (m = Lines::PIER_NAMED.match(line) || Lines::ALREADY_DOCKED.match(line))
-          return m[1]
+          pier = m[1]
+          # Only one ship is out at a time. "Already docked" at another port's pier means a
+          # different ship of yours is out there, and it must be stored before this one sails.
+          port_of_pier = Data.port_of_pier(Data.piers_titled(pier).first)
+          if port_of_pier && port_of_pier != departure
+            raise Halt, "another ship of yours is already out at #{pier} (#{port_of_pier}); store it there first (ASK <dock handler> TO STORE <hull>, twice)"
+          end
+          return pier
         end
         if Lines::NEEDS_BOATSWAIN.match?(line)
           raise Halt, "your #{@hull} is damaged or owes fees; see the boatswain (ASK <boatswain> TO FIX #{Data::HULLS.fetch(@hull)[:noun].upcase}, twice), wait about 5 minutes, then sail again"
