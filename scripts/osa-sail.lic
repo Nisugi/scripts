@@ -2261,7 +2261,7 @@ module OsaSail
       "Brisker's Cove" => { uid: 7116594, handler: 7140501, looks: "sprawling imperial" },
       "Nielira Harbor" => { uid: 7137145, handler: 14150054, looks: "ivy-draped" },
       "Glaoveln" => { uid: 7116863, handler: 4426101, looks: nil },
-      "Sleeping Drake Harbor" => { uid: 7143512, handler: 7142201, looks: nil },
+      "Sleeping Drake Harbor" => { uid: 7143512, handler: 7142201, looks: "skerry-guarded" },
       "Sailor's Grief" => { uid: 7116648, handler: 7150106, looks: nil },
     }.freeze
 
@@ -3151,6 +3151,12 @@ module OsaSail
     # -- retrieve and board -------------------------------------------
 
     def retrieve_and_board(departure)
+      # Standing on one of this port's piers with the ship in sight: just board it.
+      if Data.port_of_pier(@game.current_uid) == departure && (here = pick_ship(@game.objects.select { |o| ship_object?(o) }))
+        board(here)
+        return
+      end
+
       port = Data::PORTS.fetch(departure)
       raise Halt, "could not walk to the #{departure} dock handler" unless @game.walk_to(port[:handler])
 
@@ -3159,13 +3165,19 @@ module OsaSail
       raise Halt, "the handler named #{pier.inspect}, which is not in the pier table" if rooms.empty?
 
       chosen = nil
+      unreachable = []
       deadline = Time.now + 60
       until chosen || Time.now > deadline
         rooms.each do |uid|
-          @game.walk_to(uid)
+          next if unreachable.include?(uid)
+          unless @game.walk_to(uid)
+            unreachable << uid
+            next
+          end
           chosen = pick_ship(@game.objects.select { |o| ship_object?(o) })
           break if chosen
         end
+        raise Halt, "could not walk to any room of #{pier} (map edges to #{unreachable.join(', ')} failed)" if unreachable.size == rooms.size
         sleep 5 unless chosen
       end
       raise Halt, "could not find your #{ship_label} at #{pier}" unless chosen

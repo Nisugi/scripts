@@ -46,6 +46,7 @@ RSpec.describe OsaSail do
       expect(rooms).not_to be_empty
       expect(OsaSail::Data.port_of_pier(rooms.first)).to eq('Solhaven')
       expect(OsaSail::Data.port_looking('diverse')).to eq('Solhaven')
+      expect(OsaSail::Data.port_looking('skerry-guarded')).to eq('Sleeping Drake Harbor')
     end
   end
 
@@ -228,7 +229,7 @@ RSpec.describe OsaSail do
     def watch(watcher) = @watcher = watcher
     def unwatch = @watcher = nil
     def confirm?(_) = true
-    def current_uid = nil
+    def current_uid = @standing_uid
 
     def npcs
       @ashore && !@at_pier ? [Struct.new(:id, :noun, :name).new(482_307, 'handler', 'dock handler')] : []
@@ -237,7 +238,8 @@ RSpec.describe OsaSail do
     ShipObj = Struct.new(:id, :noun, :name)
     OURS = ShipObj.new(45_157_737, 'sloop', 'shadowy black mistwood sloop')
     THEIRS = ShipObj.new(45_200_000, 'sloop', 'shadowy black mistwood sloop')
-    attr_writer :pier_objects, :plank_down
+    attr_writer :pier_objects, :plank_down, :standing_uid
+    attr_accessor :unreachable
 
     def objects
       return [] unless @at_pier
@@ -258,6 +260,7 @@ RSpec.describe OsaSail do
 
     def walk_to(uid)
       @walks << uid
+      return false if @unreachable&.include?(uid)
       @at_pier = OsaSail::Data::PIERS.key?(uid)
       true
     end
@@ -484,6 +487,25 @@ RSpec.describe OsaSail do
       expect(described_class.wind_duration(612, 50)).to eq(144)
       expect(described_class.wind_duration(612, 2)).to eq(0)
       expect(described_class.wind_duration(912, 100)).to eq(90)
+    end
+
+    it 'boards straight from the pier it is standing on' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Green Pier] (7124001)", ashore: true)
+      game.standing_uid = 7_124_001
+      game.instance_variable_set(:@at_pier, true)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect(trip.run).to eq(:arrived)
+      expect(game.walks).to be_empty
+      expect(game.commands).not_to include(a_string_starting_with('ask #'))
+      expect(game.commands.index("go ##{FakeGame::OURS.id}")).to be < game.commands.index('ship flag')
+    end
+
+    it 'gives up on a pier whose rooms go2 cannot reach, naming them' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
+      game.unreachable = OsaSail::Data.piers_titled("North 'Haven Quay, Green Pier")
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect { trip.run }.to raise_error(OsaSail::Halt, /could not walk to any room of North 'Haven Quay, Green Pier/)
+      expect(game.walks.size).to eq(1 + game.unreachable.size)
     end
 
     it 'boards by the gangplank when it is already down' do
