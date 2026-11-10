@@ -3162,7 +3162,6 @@ module OsaSail
 
     def make_ready
       go_to 'Main Deck'
-      @game.send('watch ocean', Regexp.union(Lines::WATCHING, Lines::CANT_GO), timeout: 4) if @watch
       raise_white_flag
       go_to 'Main Deck'
       @game.send('pull gangplank', Regexp.union(Lines::PLANK_UP, /gangplank/), timeout: 5)
@@ -3237,6 +3236,9 @@ module OsaSail
         end
         if line && Lines::DEPARTED.match?(line)
           @watcher.take_all
+          # WATCH OCEAN only works once the ship is on the water; in port it answers
+          # "I could not find what you were referring to."
+          @game.send('watch ocean', Regexp.union(Lines::WATCHING, Lines::CANT_GO), timeout: 4) if @watch
           return
         end
       end

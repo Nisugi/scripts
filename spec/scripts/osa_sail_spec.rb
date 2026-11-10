@@ -343,6 +343,7 @@ RSpec.describe OsaSail do
       expect(c.rindex('lower sail')).to be < c.index('push capstan')
       expect(c.rindex('push capstan')).to be < c.index('depart')
       expect(c.count('depart')).to eq(2)
+      expect(c.index('watch ocean')).to eq(c.rindex('depart') + 1)
       expect(c.last(2)).to eq(['push gangplank', 'go gangplank'])
 
       legs = OsaSail::Course.plot(SOLHAVEN, KRAKENS_FALL)
