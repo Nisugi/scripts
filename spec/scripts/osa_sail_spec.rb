@@ -233,13 +233,26 @@ RSpec.describe OsaSail do
       @ashore && !@at_pier ? [Struct.new(:id, :noun, :name).new(482_307, 'handler', 'dock handler')] : []
     end
 
+    ShipObj = Struct.new(:id, :noun, :name)
+    OURS = ShipObj.new(45_157_737, 'sloop', 'shadowy black mistwood sloop')
+    THEIRS = ShipObj.new(45_200_000, 'sloop', 'shadowy black mistwood sloop')
+    attr_writer :pier_objects
+
     def objects
-      @at_pier ? [Struct.new(:noun, :name).new('sloop', 'shadowy black mistwood sloop')] : []
+      return [] unless @at_pier
+      @pier_objects || [OURS]
     end
 
     def quiet(command, _pattern, **)
       @commands << command
-      ['Ships you own:', 'SLOOP    Docked at: Solhaven'] if command == 'ship info'
+      case command
+      when 'ship info' then ['Ships you own:', 'SLOOP    Docked at: Solhaven']
+      when 'ship info sloop'
+        ['SHIP INFO', ' Ship Type: a Sloop', ' Ship Name: The Wild Maroon Tempest', ' Ship Status',
+         ' This ship does not currently have any fees associated with it.',
+         ' This ship is not currently under repair.', ' Ship is currently docked at: Solhaven',
+         ' Hull Color: shadowy black', ' Hull Material: mistwood']
+      end
     end
 
     def walk_to(uid)
@@ -288,9 +301,12 @@ RSpec.describe OsaSail do
         else
           %(Kilvath says, "Looks like we have some space around the North 'Haven Quay, Green Pier."  The dock handler points to the northwest.)
         end
-      when 'go sloop'
+      when "go ##{OURS.id}"
         @title = '[Sloop, Main Deck] (-7117010)'
         'A shadowy black mistwood gangplank suddenly protrudes from the side of the sloop before slamming down.'
+      when "go ##{THEIRS.id}" then raise 'boarded somebody else\'s sloop'
+      when "look ##{OURS.id}" then %(Sprawling across the back of the mistwood sloop it reads, "The Wild Maroon Tempest")
+      when "look ##{THEIRS.id}" then %(Sprawling across the back of the mistwood sloop it reads, "The Other Fellow")
       when 'watch ocean' then 'You begin to watch the ocean waters surrounding the ship....'
       when 'ship flag' then 'The mistwood sloop is currently flying no flag.'
       when 'ship flag white'
@@ -397,7 +413,8 @@ RSpec.describe OsaSail do
       expect(game.walks.first).to eq(OsaSail::Data::PORTS['Solhaven'][:handler])
       expect(game.walks[1..]).to include(*OsaSail::Data.piers_titled("North 'Haven Quay, Green Pier").first(1))
       expect(game.commands.count { |x| x.start_with?('ask #') }).to eq(2)
-      expect(game.commands.index('go sloop')).to be < game.commands.index('ship flag')
+      expect(game.commands.index("go ##{FakeGame::OURS.id}")).to be < game.commands.index('ship flag')
+      expect(game.commands).not_to include(a_string_starting_with('look #'))
     end
 
     it 'tries another heading when the wheel will not hold, and still arrives' do
@@ -457,6 +474,35 @@ RSpec.describe OsaSail do
       expect(described_class.wind_duration(612, 50)).to eq(144)
       expect(described_class.wind_duration(612, 2)).to eq(0)
       expect(described_class.wind_duration(912, 100)).to eq(90)
+    end
+
+    it 'tells our sloop from an identical one by its nameplate' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
+      game.pier_objects = [FakeGame::THEIRS, FakeGame::OURS]
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect(trip.run).to eq(:arrived)
+      looks = game.commands.grep(/^look #/)
+      expect(looks).to eq(["look ##{FakeGame::THEIRS.id}", "look ##{FakeGame::OURS.id}"])
+      expect(game.commands).to include("go ##{FakeGame::OURS.id}")
+    end
+
+    it 'ignores a sloop of another colour' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
+      game.pier_objects = [FakeGame::ShipObj.new(1, 'sloop', 'a crimson oak sloop')]
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      allow(game).to receive(:sleep)
+      expect { trip.run }.to raise_error(OsaSail::Halt, /could not find your Sloop "The Wild Maroon Tempest"/)
+    end
+
+    it 'halts before walking when SHIP INFO says the ship is under repair' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
+      allow(game).to receive(:quiet).and_wrap_original do |m, command, *rest, **kw|
+        lines = m.call(command, *rest, **kw)
+        command == 'ship info sloop' ? lines.map { |l| l.sub('is not currently under repair', 'is currently under repair') } : lines
+      end
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect { trip.run }.to raise_error(OsaSail::Halt, /under repair/)
+      expect(game.walks).to be_empty
     end
 
     it "recognises a man o' war on the pier by name, since its noun is war" do

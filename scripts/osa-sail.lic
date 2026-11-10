@@ -2815,6 +2815,11 @@ module OsaSail
   module Lines
     SHIP_OWNED       = /^\s*(SLOOP|BRIGANTINE|CARRACK|GALLEON|FRIGATE|MAN O' WAR)\s+(.+?)\s*$/i.freeze
     DOCKED_AT        = /Docked at:\s*(.+?)\s*$/.freeze
+    SHIP_NAME        = /^Ship Name:\s*(.+?)\s*$/.freeze
+    HULL_COLOR       = /^Hull Color:\s*(.+?)\s*$/.freeze
+    HULL_MATERIAL    = /^Hull Material:\s*(.+?)\s*$/.freeze
+    SHIP_DOCKED      = /Ship is currently docked at:\s*(.+?)\s*$/.freeze
+    NAMEPLATE        = /it reads, "(.+?)"/.freeze
     FEE              = /You're about to launch your .+?  It'll cost about ([\d,]+) silvers to get it ready\./.freeze
     PIER_NAMED       = /"Looks like we have some space around the (.+?)\."/.freeze
     ALREADY_DOCKED   = /"What\?  You already have a ship docked at the (.+?)!"/.freeze
@@ -3094,8 +3099,13 @@ module OsaSail
       end
       read_ship_info
       raise Halt, 'SHIP INFO names no ship of yours; pass --hull=<name>' unless @hull
+      raise Halt, "your #{ship_label} is under repair; wait for the boatswain to finish" if @under_repair
+      raise Halt, "your #{ship_label} owes fees; see the boatswain before sailing" if @owes_fees
     end
 
+    # SHIP INFO lists every ship owned with the port it is docked at; SHIP INFO <hull> adds
+    # the ship's name, its hull colour and material (how it reads on a pier), and whether
+    # it owes fees or is under repair, which the dock handler would otherwise refuse over.
     def read_ship_info
       lines = @game.quiet('ship info', /Ships you own|Please enter a valid ship/) || []
       lines.each do |l|
@@ -3106,6 +3116,23 @@ module OsaSail
         @hull ||= found
         @docked_at = Data.port_named(Lines::DOCKED_AT.match(m[2])&.[](1))
       end
+      return unless @hull
+
+      detail = @game.quiet("ship info #{Data::HULLS.fetch(@hull)[:noun]}", /SHIP INFO|Please enter a valid ship/) || []
+      detail.each do |l|
+        text = l.gsub(/<[^>]+>/, '').strip
+        if (m = Lines::SHIP_NAME.match(text)) then @ship_name = m[1]
+        elsif (m = Lines::HULL_COLOR.match(text)) then @hull_color = m[1] unless m[1] =~ /not set/i
+        elsif (m = Lines::HULL_MATERIAL.match(text)) then @hull_material = m[1] unless m[1] =~ /not set/i
+        elsif (m = Lines::SHIP_DOCKED.match(text)) then @docked_at = Data.port_named(m[1]) || @docked_at
+        elsif text =~ /fees associated/ && text !~ /does not/ then @owes_fees = true
+        elsif text =~ /under repair/ && text !~ /not currently under repair/ then @under_repair = true
+        end
+      end
+    end
+
+    def ship_label
+      @ship_name ? "#{@hull} #{@ship_name.inspect}" : @hull
     end
 
     # -- retrieve and board -------------------------------------------
@@ -3118,22 +3145,19 @@ module OsaSail
       rooms = Data.piers_titled(pier)
       raise Halt, "the handler named #{pier.inspect}, which is not in the pier table" if rooms.empty?
 
-      noun = Data::HULLS.fetch(@hull)[:noun]
-      found = nil
+      chosen = nil
       deadline = Time.now + 60
-      until found || Time.now > deadline
+      until chosen || Time.now > deadline
         rooms.each do |uid|
           @game.walk_to(uid)
-          if @game.objects.any? { |o| ship_object?(o) }
-            found = uid
-            break
-          end
+          chosen = pick_ship(@game.objects.select { |o| ship_object?(o) })
+          break if chosen
         end
-        sleep 5 unless found
+        sleep 5 unless chosen
       end
-      raise Halt, "could not find your #{@hull} at #{pier}" unless found
+      raise Halt, "could not find your #{ship_label} at #{pier}" unless chosen
 
-      board(noun)
+      board(chosen)
     end
 
     def ask_handler(departure)
@@ -3165,19 +3189,38 @@ module OsaSail
       raise Halt, 'the dock handler quoted a fee twice and never named a pier'
     end
 
+    # Other people's ships share the piers. An object is a candidate when it is the right
+    # hull ("a man o' war" carries the noun "war", so the name is checked too) and carries
+    # the hull colour and material SHIP INFO gave, when they are set.
+    def ship_object?(obj)
+      name = obj.name.to_s.downcase
+      hull = Data::HULLS.fetch(@hull)
+      return false unless obj.noun == hull[:noun] || name.include?(@hull.downcase)
+      return false if @hull_color && !name.include?(@hull_color.downcase)
+      return false if @hull_material && !name.include?(@hull_material.downcase)
+
+      true
+    end
+
+    # One customised candidate is ours. Otherwise (an uncustomised hull looks like anyone's,
+    # or several match) LOOK at each and compare the nameplate with the ship's name.
+    def pick_ship(candidates)
+      return nil if candidates.empty?
+      return candidates.first if candidates.size == 1 && (@hull_color || @hull_material)
+      return candidates.first unless @ship_name
+
+      candidates.find do |obj|
+        line = @game.send("look ##{obj.id}", Lines::NAMEPLATE, timeout: 4)
+        line && Lines::NAMEPLATE.match(line)[1] == @ship_name
+      end
+    end
+
     # GO <ship> works whether the gangplank is out or not: the game deploys it on the way.
     # Recorded answers are "gangplank suddenly protrudes ... You make your way up" and
     # "you already deployed it! ... You make your way across".
-    # "a man o' war" carries the noun "war", not "man": match the hull name on the object's
-    # name as well as the noun the GO command uses.
-    def ship_object?(obj)
-      hull = Data::HULLS.fetch(@hull)
-      obj.noun == hull[:noun] || obj.name.to_s.downcase.include?(@hull.downcase)
-    end
-
-    def board(noun)
+    def board(ship)
       4.times do
-        line = @game.send("go #{noun}", Regexp.union(Lines::BOARDED, Lines::PLANK_DEPLOYS, Lines::CANT_GO), timeout: 6)
+        line = @game.send("go ##{ship.id}", Regexp.union(Lines::BOARDED, Lines::PLANK_DEPLOYS, Lines::CANT_GO), timeout: 6)
         sleep 1
         break if Deck.parse_title(@game.title)
         next unless line && Lines::CANT_GO.match?(line)
@@ -3186,7 +3229,7 @@ module OsaSail
         break if Deck.parse_title(@game.title)
       end
       parsed = Deck.parse_title(@game.title)
-      raise Halt, "could not board your #{@hull}" unless parsed
+      raise Halt, "could not board your #{ship_label}" unless parsed
       @hull, @deck = parsed
       @aboard = true
     end
