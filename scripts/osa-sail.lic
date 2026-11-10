@@ -2819,6 +2819,7 @@ module OsaSail
     PIER_NAMED       = /"Looks like we have some space around the (.+?)\."/.freeze
     ALREADY_DOCKED   = /"What\?  You already have a ship docked at the (.+?)!"/.freeze
     REFUSED          = /come back to me when you have enough money/.freeze
+    NEEDS_BOATSWAIN  = /Your ship was recently damaged or has fees associated with it/.freeze
     BOARDED          = /You make your way (?:up|across) the .+? gangplank/.freeze
     PLANK_DEPLOYS    = /gangplank suddenly protrudes|you already deployed it|there is already a .+? gangplank deployed/.freeze
     CANT_GO          = /Where are you trying to go|I could not find what you were referring to/.freeze
@@ -3139,12 +3140,15 @@ module OsaSail
       npc = @game.npcs.find { |n| n.noun =~ /^(handler|master|warden)$/ && (n.name =~ /dock/ || n.noun == 'warden') }
       raise Halt, 'no dock handler here' unless npc
 
-      answer = Regexp.union(Lines::FEE, Lines::PIER_NAMED, Lines::ALREADY_DOCKED, Lines::REFUSED)
+      answer = Regexp.union(Lines::FEE, Lines::PIER_NAMED, Lines::ALREADY_DOCKED, Lines::REFUSED, Lines::NEEDS_BOATSWAIN)
       2.times do
         line = @game.send("ask ##{npc.id} about retrieve #{Data::HULLS.fetch(@hull)[:noun]}", answer, timeout: 6)
         raise Halt, 'the dock handler did not answer' unless line
         if (m = Lines::PIER_NAMED.match(line) || Lines::ALREADY_DOCKED.match(line))
           return m[1]
+        end
+        if Lines::NEEDS_BOATSWAIN.match?(line)
+          raise Halt, "your #{@hull} is damaged or owes fees; see the boatswain (ASK <boatswain> TO FIX #{Data::HULLS.fetch(@hull)[:noun].upcase}, twice), wait about 5 minutes, then sail again"
         end
         if Lines::REFUSED.match?(line)
           fee = Data::HULLS.fetch(@hull)[:fee]

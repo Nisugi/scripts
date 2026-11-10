@@ -459,6 +459,21 @@ RSpec.describe OsaSail do
       expect(described_class.wind_duration(912, 100)).to eq(90)
     end
 
+    it 'halts with directions when the handler sends you to the boatswain' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
+      allow(game).to receive(:send).and_wrap_original do |m, command, *rest, **kw|
+        if command.start_with?('ask #')
+          game.commands << command
+          %(Kilvath says, "Your ship was recently damaged or has fees associated with it.  You may want to go visit the boatswain to get it back out on the sea!")
+        else
+          m.call(command, *rest, **kw)
+        end
+      end
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect { trip.run }.to raise_error(OsaSail::Halt, /see the boatswain .*FIX SLOOP/)
+      expect(game.commands.count { |c| c.start_with?('ask #') }).to eq(1)
+    end
+
     it 'halts when the ship is already at the target port' do
       game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)')
       trip = described_class.new(game, 'Solhaven', confirm: false)
