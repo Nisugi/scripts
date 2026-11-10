@@ -165,13 +165,14 @@ RSpec.describe OsaSail do
     let(:watcher) { described_class.new }
 
     it 'turns recorded lines into events and strips markup' do
-      expect(watcher.see('<pushBold/>The <a exist="1" noun="sloop">mistwood sloop</a> cuts through the ocean, heading north at full speed.<popBold/>')).to eq([:moved, 'n'])
+      expect(watcher.see("<pushBold/>The <a exist=\"1\" noun=\"sloop\">mistwood sloop</a> cuts through the ocean, heading north at full speed.<popBold/>\r\n")).to eq([:moved, 'n'])
+      expect(watcher.see("The mistwood sloop cuts through the ocean, heading northwest at full speed.\r\n")).to eq([:moved, 'nw'])
       expect(watcher.see('A large swell crashes into the side of the mistwood sloop!  The sound of the anchor can be heard rattling down the side of the mistwood sloop.')).to eq([:anchor_down])
       expect(watcher.see('The mistwood sloop suddenly drifts from its course as the wooden wheel spins out of control!')).to eq([:heading_lost])
       expect(watcher.see('The sound of ropes coming free of the rigging prelude the whipping of a storm grey canvas sail!')).to eq([:sails_furled])
       expect(watcher.see("The mistwood sloop drifts steadily toward the bustling port.  Shouts are heard from the piers nearby directing the sloop to Kraken's Fall, Fourth Pier.  As the sloop")).to eq([:arrived, 'bustling', "Kraken's Fall, Fourth Pier"])
       expect(watcher.see('You grab hold of the wooden wheel and do your best to steer the ship to the north.')).to be_nil
-      expect(watcher.take_all.size).to eq(5)
+      expect(watcher.take_all.size).to eq(6)
     end
 
     it 'passes the server string through its hook unchanged' do
@@ -186,13 +187,19 @@ RSpec.describe OsaSail do
   class FakeGame
     attr_reader :commands, :walks, :logs, :position
 
-    attr_reader :casts
+    attr_reader :casts, :waits
 
-    def initialize(start_title:, swell_after: nil, ashore: false, wind: false)
+    # blocked: [heading, times] makes that heading fail "wheel slowly turns off course"
+    # that many times (nil times = forever), the way a pursuing pirate does.
+    def initialize(start_title:, swell_after: nil, ashore: false, wind: false, blocked: nil, flag_cooldown: false)
       @title = start_title
       @wind = wind
       @casts = []
+      @waits = []
       @winded = false
+      @blocked_heading, @blocked_times = blocked
+      @flag_cooldown = flag_cooldown
+      @flag_asks = 0
       @commands = []
       @walks = []
       @logs = []
@@ -241,8 +248,17 @@ RSpec.describe OsaSail do
       true
     end
 
+    def wait(seconds) = @waits << seconds
+
     def idle
       return unless @held
+      if @held == @blocked_heading && (@blocked_times.nil? || @blocked_times > 0)
+        @blocked_times -= 1 if @blocked_times
+        @watcher.see('The wooden wheel slowly turns off course.')
+        @watcher.see('Aimless, the mistwood sloop rocks idly in the ocean waters.')
+        @held = nil
+        return
+      end
       if @held == 'port'
         if (port = OsaSail::Data.port_of_ocean_room(@position))
           @watcher.see("The mistwood sloop drifts steadily toward the #{OsaSail::Data::PORTS[port][:looks]} port.  Shouts are heard from the piers nearby directing the sloop to #{port}, Fourth Pier.  As the mistwood sloop sails toward the designated pier, a pair of workers swing aboard.")
@@ -277,7 +293,13 @@ RSpec.describe OsaSail do
         'A shadowy black mistwood gangplank suddenly protrudes from the side of the sloop before slamming down.'
       when 'watch ocean' then 'You begin to watch the ocean waters surrounding the ship....'
       when 'ship flag' then 'The mistwood sloop is currently flying no flag.'
-      when 'ship flag white' then 'Ashryn just raised a white flag atop the mistwood sloop.'
+      when 'ship flag white'
+        @flag_asks += 1
+        if @flag_cooldown && @flag_asks == 1
+          'Time until flag can be changed: 6 minutes'
+        else
+          'Ashryn just raised a white flag atop the mistwood sloop.'
+        end
       when 'pull gangplank' then 'You grab the mistwood gangplank in both hands and pull it back up on the deck.'
       when 'look sail' then @winded ? 'The canvas sail is fully lowered and filled with magical wind.' : 'The canvas sail is currently fully lowered.'
       when 'lower sail'
@@ -347,8 +369,9 @@ RSpec.describe OsaSail do
       expect(c.last(2)).to eq(['push gangplank', 'go gangplank'])
 
       legs = OsaSail::Course.plot(SOLHAVEN, KRAKENS_FALL)
-      expect(wheel_turns(game).size).to eq(legs.size + 1)
-      expect(wheel_turns(game).last).to eq('turn wheel port')
+      planned = legs.map { |h, _| "turn wheel #{OsaSail::Data::HEADING_WORD[h]}" } + ['turn wheel port']
+      expect(wheel_turns(game)).to eq(planned)
+      expect(game.logs).not_to include(a_string_matching(/off course/))
       expect(game.position).to eq(KRAKENS_FALL)
       expect(trip.position).to eq(KRAKENS_FALL)
       expect(game.title).to start_with("[Kraken's Fall")
@@ -375,6 +398,49 @@ RSpec.describe OsaSail do
       expect(game.walks[1..]).to include(*OsaSail::Data.piers_titled("North 'Haven Quay, Green Pier").first(1))
       expect(game.commands.count { |x| x.start_with?('ask #') }).to eq(2)
       expect(game.commands.index('go sloop')).to be < game.commands.index('ship flag')
+    end
+
+    it 'tries another heading when the wheel will not hold, and still arrives' do
+      first = OsaSail::Course.plot(SOLHAVEN, KRAKENS_FALL).first[0]
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', blocked: [first, 3])
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect(trip.run).to eq(:arrived)
+
+      turns = game.commands.grep(/^turn wheel/)
+      expect(turns.first(3)).to all(eq("turn wheel #{OsaSail::Data::HEADING_WORD[first]}"))
+      expect(turns[3]).not_to eq("turn wheel #{OsaSail::Data::HEADING_WORD[first]}")
+      expect(game.logs).to include(a_string_matching(/will not hold; trying/))
+      expect(game.logs.grep(/wheel turned off course/).size).to eq(3)
+      expect(game.position).to eq(KRAKENS_FALL)
+    end
+
+    it 'gives the wheel back when no heading holds' do
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', blocked: ['any', nil])
+      game.instance_variable_set(:@blocked_heading, nil)
+      allow(game).to receive(:idle) do
+        game.instance_variable_get(:@watcher).see('The wooden wheel slowly turns off course.')
+        game.instance_variable_set(:@held, nil)
+      end
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect { trip.run }.to raise_error(OsaSail::Halt, /will not hold any course/)
+      expect(game.commands.grep(/^turn wheel/).size).to be <= described_class::STUCK_LIMIT + 1
+    end
+
+    it 'waits out a short white-flag cooldown instead of sailing flagless' do
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', flag_cooldown: true)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect(trip.run).to eq(:arrived)
+      expect(game.waits).to eq([365])
+      expect(game.commands.count('ship flag white')).to eq(2)
+      expect(game.commands.index('pull gangplank')).to be > game.commands.rindex('ship flag white')
+    end
+
+    it 'sails at once on a cooldown with --no-flag-wait' do
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', flag_cooldown: true)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false, flag_wait: false)
+      expect(trip.run).to eq(:arrived)
+      expect(game.waits).to be_empty
+      expect(game.commands.count('ship flag white')).to eq(1)
     end
 
     it 'casts Breeze into each sail once, after looking, and times the recast by level' do

@@ -12,6 +12,7 @@
                       level-based duration ((3 * level / 9) * 9 s), Call Wind every 90 s
     --no-confirm      skip the plan confirmation
     --no-watch        do not send WATCH OCEAN
+    --no-flag-wait    sail at once if the white flag is on cooldown (default: wait up to 10 min for it)
     --hull=<name>     name the hull when SHIP INFO cannot be read (sloop, brigantine, carrack, galleon, frigate, man o' war)
 
   The ship is left at the far pier. Nothing is stored.
@@ -2822,9 +2823,9 @@ module OsaSail
     PLANK_DEPLOYS    = /gangplank suddenly protrudes|you already deployed it|there is already a .+? gangplank deployed/.freeze
     CANT_GO          = /Where are you trying to go|I could not find what you were referring to/.freeze
     WATCHING         = /You begin to watch the ocean waters|You are already watching the ocean/.freeze
-    FLAG_IS          = /^The .+? is currently flying (.+?)\.$/.freeze
+    FLAG_IS          = /^The .+? is currently flying (.+?)\./.freeze
     FLAG_RAISED      = /just raised a (.+?) flag atop|Your ship is now flying|already flying/.freeze
-    FLAG_COOLDOWN    = /Time until flag can be changed/.freeze
+    FLAG_COOLDOWN    = /Time until flag can be changed: (\d+) (minute|second)/.freeze
     PLANK_UP         = /pull it back up on the deck|sending it back up on the deck|retracting your gangplank/.freeze
     PLANK_DOWN       = /good shove, deploying it below/.freeze
     SAIL_STATE       = /sail (?:until it is (at half mast|fully open)|is (raised halfway|fully raised)|is already (lowered|raised) as far as it can go)[.!]/.freeze
@@ -2839,7 +2840,7 @@ module OsaSail
     DEPARTED         = /drifts out into the open sea|You're already out on the ocean!/.freeze
     DEPART_PLANK     = /You can't set sail without retracting your gangplank!/.freeze
     NOT_CAPTAIN      = /Only the Captain can begin your voyage/.freeze
-    MOVED            = /^The .+? (?:drifts slowly (\w+), its sails fully raised|cuts through the ocean, heading (\w+?)(?: at full speed)?)\.$/.freeze
+    MOVED            = /^The .+? (?:drifts slowly (\w+), its sails fully raised|cuts through the ocean, heading (\w+?)(?: at full speed)?)\./.freeze
     STEERED          = /do your best to steer the ship (.+?)\.|wheel is already turned that way!/.freeze
     STEER_REFUSED    = /you'd have better luck/.freeze
     ARRIVED          = /drifts steadily toward the (.+?) port\.  Shouts are heard from the piers nearby directing the .+? to (.+?)\.  As the /.freeze
@@ -2874,8 +2875,9 @@ module OsaSail
       end
     end
 
+    # The hook hands over the raw server string, markup and line ending included.
     def see(raw)
-      line = raw.gsub(/<[^>]+>/, '')
+      line = raw.gsub(/<[^>]+>/, '').strip
       event =
         if (m = Lines::MOVED.match(line)) then [:moved, Data::WORD_HEADING[m[1] || m[2]]]
         elsif (m = Lines::ARRIVED.match(line)) then [:arrived, m[1], m[2]]
@@ -2977,8 +2979,13 @@ module OsaSail
       sleep 0.5
     end
 
+    def wait(seconds)
+      sleep seconds
+    end
+
     def watch(watcher)
       DownstreamHook.add(HOOK, watcher.hook)
+      before_dying { DownstreamHook.remove(HOOK) }
     end
 
     def unwatch
@@ -3021,12 +3028,20 @@ module OsaSail
 
     attr_reader :hull, :deck, :position, :held
 
-    def initialize(game, target, call_wind: false, confirm: true, watch: true, hull: nil)
+    # Wait for the white flag's cooldown when it is at most this long. Sailing under no
+    # flag spawns enemy ships, and one of those cost a voyage in testing.
+    FLAG_WAIT_MAX = 10 * 60
+    # Headings that would not hold before trying another, and before giving up.
+    STUCK_RETRIES = 3
+    STUCK_LIMIT = 12
+
+    def initialize(game, target, call_wind: false, confirm: true, watch: true, hull: nil, flag_wait: true)
       @game = game
       @target = target
       @call_wind = call_wind
       @confirm = confirm
       @watch = watch
+      @flag_wait = flag_wait
       @hull = hull
       @watcher = Watcher.new
       @held = Course::STILL
@@ -3175,11 +3190,19 @@ module OsaSail
       line = @game.send('ship flag', Lines::FLAG_IS, timeout: 4)
       return if line && Lines::FLAG_IS.match(line)[1] =~ /white/
       go_to "Crow's Nest"
-      2.times do
+      3.times do
         line = @game.send('ship flag white', Regexp.union(Lines::FLAG_RAISED, Lines::FLAG_COOLDOWN), timeout: 5)
-        break if line
+        return unless line && (m = Lines::FLAG_COOLDOWN.match(line))
+
+        seconds = m[1].to_i * (m[2] == 'minute' ? 60 : 1)
+        unless @flag_wait && seconds <= FLAG_WAIT_MAX
+          @game.log "the flag cannot be changed for #{m[1]} #{m[2]}s; sailing under the current flag (enemy ships may spawn)"
+          return
+        end
+        @game.log "the flag cannot be changed for #{m[1]} #{m[2]}s; waiting for white"
+        @game.wait(seconds + 5)
       end
-      @game.log 'the flag cannot be changed yet; sailing under the current flag' if line && Lines::FLAG_COOLDOWN.match?(line)
+      @game.log 'could not raise the white flag; sailing under the current flag'
     end
 
     def lower_all_sails
@@ -3271,9 +3294,16 @@ module OsaSail
           next
         end
 
-        legs = Course.plot(@position, goal_uid, holding: @held)
-        raise Halt, "lost: no course from #{@position} to #{goal_uid}" unless legs
-        want = legs.first[0]
+        # Follow the plotted course room by room. Re-plot only when the ship lands somewhere
+        # other than the next room on it: re-plotting after every move, with "keep the
+        # heading held" as the tie-break, let the ship wander along an equal-length route
+        # instead of the one it announced.
+        if @steps.nil? || @steps.empty?
+          legs = Course.plot(@position, goal_uid, holding: @held)
+          raise Halt, "lost: no course from #{@position} to #{goal_uid}" unless legs
+          @steps = legs.flat_map { |h, rooms| rooms.map { |r| [h, r] } }
+        end
+        want = heading_that_might_hold(goal_uid, @steps.first[0])
         steer(want) if want != @held
         recast_wind
 
@@ -3284,7 +3314,37 @@ module OsaSail
         nxt = Data.toward(@position, heading)
         raise Halt, "lost: the ship went #{Data::HEADING_WORD[heading]} from #{@position}, which the chart has no water for" unless nxt
         @position = nxt
+        @stuck = 0
+        @stuck_headings = []
+        if @steps.first[1] == nxt
+          @steps.shift
+        else
+          @game.log "off course at #{nxt}; re-plotting"
+          @steps = nil
+        end
       end
+    end
+
+    # Under pursuit the wheel "slowly turns off course" and the ship sits still. In testing
+    # the same heading failed eight times while a different one moved at once, so after a
+    # few failures try the other true headings from this room, nearest-to-goal first, and
+    # give the wheel back once nothing holds.
+    def heading_that_might_hold(goal_uid, want)
+      @stuck ||= 0
+      @stuck_headings ||= []
+      return want if @stuck < STUCK_RETRIES
+      raise Halt, 'the ship will not hold any course here (under attack?)' if @stuck >= STUCK_LIMIT
+
+      @stuck_headings << want unless @stuck_headings.include?(want)
+      options = Data::HEADINGS.select { |h| Data.runs_true?(@position, h) && !@stuck_headings.include?(h) }
+      ranked = options.map { |h| [Course.plot(Data.toward(@position, h), goal_uid), h] }
+                      .reject { |legs, _| legs.nil? }
+                      .sort_by { |legs, _| Course.rooms(legs) }
+      return want if ranked.empty?
+
+      choice = ranked.first[1]
+      @game.log "#{Data::HEADING_WORD[want]} will not hold; trying #{Data::HEADING_WORD[choice]}"
+      choice
     end
 
     def steer(heading)
@@ -3301,8 +3361,10 @@ module OsaSail
       raise Halt, "the wheel would not turn #{word}"
     end
 
+    # One game event often arrives as two lines ("wheel slowly turns off course" then
+    # "Aimless, the sloop rocks idly"), so a batch is handled once per kind.
     def handle_events
-      @watcher.take_all.each do |event, *args|
+      @watcher.take_all.uniq(&:first).each do |event, *args|
         case event
         when :anchor_down
           @game.log 'a swell dropped the anchor; raising it'
@@ -3313,7 +3375,8 @@ module OsaSail
           lower_all_sails
           @held = Course::STILL
         when :heading_lost
-          @game.log 'the wheel spun; re-steering'
+          @stuck = (@stuck || 0) + 1
+          @game.log "the wheel turned off course (#{@stuck}); re-steering"
           @held = Course::STILL
         when :arrived
           port = Data.port_looking(args[0]) || args[0]
@@ -3322,9 +3385,11 @@ module OsaSail
         when :grappled
           raise Halt, 'an enemy ship has grappled us'
         when :enemy
-          @game.log 'an enemy ship is near'
+          @game.log 'an enemy ship is near' unless @enemy_near
+          @enemy_near = true
         when :enemy_left
           @game.log 'the enemy ship changed course away'
+          @enemy_near = false
         end
       end
     end
@@ -3392,19 +3457,20 @@ module OsaSail
         ;osa-sail <port>            retrieve or board your ship, sail to <port>, step onto the pier
         ;osa-sail route <port>      show the course only
         ;osa-sail ports             list the ports
-        options: --call-wind  --no-confirm  --no-watch  --hull=<name>
+        options: --call-wind  --no-confirm  --no-watch  --no-flag-wait  --hull=<name>
         ports: #{Data::PORTS.keys.join(', ')}
       HELP
     end
 
     def self.main(args, game = Game.new)
       words = args.dup
-      opts = { call_wind: false, confirm: true, watch: true, hull: nil }
+      opts = { call_wind: false, confirm: true, watch: true, hull: nil, flag_wait: true }
       words.reject! do |w|
         case w
         when '--call-wind' then opts[:call_wind] = true
         when '--no-confirm' then opts[:confirm] = false
         when '--no-watch' then opts[:watch] = false
+        when '--no-flag-wait' then opts[:flag_wait] = false
         when /^--hull=(.+)$/ then opts[:hull] = Deck.hull_by_name(Regexp.last_match(1))
         else next false
         end
