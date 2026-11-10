@@ -525,10 +525,11 @@ RSpec.describe OsaSail do
         end
       end
       allow(game).to receive(:walk_to).and_wrap_original do |m, uid|
+        ok = m.call(uid)
         game.instance_variable_set(:@at_pier, true) if uid == 4_426_101
-        m.call(uid)
+        ok
       end
-      trip = described_class.new(game, 'Solhaven', confirm: false)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
       expect(trip.run).to eq(:arrived)
       expect(game.walks).to include(4_426_101)
     end
