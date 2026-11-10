@@ -2576,7 +2576,9 @@ module OsaSail
       "Man O' War" => { base: -7117100, decks: MAN_O_WAR_DECKS, masts: ['Main Deck', 'Mid Deck', 'Forward Deck'], fee: 12_500, noun: 'man' }
     }.freeze
     VERIFIED_HULLS = ['Sloop'].freeze
-    HULL_TITLE = /^\[(Sloop|Brigantine|Carrack|Galleon|Frigate|Man O' War), ([^\]]+)\]/.freeze
+    # Lich appends " - <room id>" to the title when room-id display is on; the deck name
+    # stops before it.
+    HULL_TITLE = /^\[(Sloop|Brigantine|Carrack|Galleon|Frigate|Man O' War), ([^\]]+?)(?: - -?\d+)?\]/.freeze
     ENEMY_TITLE = /^\[Enemy Ship, /.freeze
 
     # deck => { neighbouring deck => command }. Main Deck's east and Forward Deck's west have

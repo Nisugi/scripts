@@ -79,6 +79,8 @@ RSpec.describe OsaSail do
     it 'reads the hull and deck from a title' do
       expect(OsaSail::Deck.parse_title("[Sloop, Main Deck] (-7117010)")).to eq(['Sloop', 'Main Deck'])
       expect(OsaSail::Deck.parse_title("[Man O' War, Forward Crow's Nest]")).to eq(["Man O' War", "Forward Crow's Nest"])
+      expect(OsaSail::Deck.parse_title('[Sloop, Main Deck - 29038] (u-7117010) (-7117010)')).to eq(['Sloop', 'Main Deck'])
+      expect(OsaSail::Deck.parse_title('[Sloop, Main Deck - -7117010]')).to eq(['Sloop', 'Main Deck'])
       expect(OsaSail::Deck.parse_title('[Enemy Ship, Helm]')).to be_nil
       expect(OsaSail::Deck.parse_title("[North 'Haven Quay, Green Pier]")).to be_nil
     end
