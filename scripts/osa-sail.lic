@@ -3172,8 +3172,9 @@ module OsaSail
 
       chosen = nil
       unreachable = []
-      deadline = Time.now + 60
-      until chosen || Time.now > deadline
+      # The ship takes a moment to appear after the handler sends it: 12 passes, 5 s apart.
+      12.times do
+        break if chosen
         rooms.each do |uid|
           next if unreachable.include?(uid)
           unless @game.walk_to(uid)
