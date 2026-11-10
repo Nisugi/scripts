@@ -2747,8 +2747,10 @@ module OsaSail
       legs.size - (legs.first && legs.first[0] == holding ? 1 : 0)
     end
 
-    # About 60 s from DEPART to the first move, then 20 s a room at full speed. Wheel
-    # turns happen between moves and add nothing.
+    # About 60 s from DEPART to the first move, then 20 s a room at full speed, from live
+    # sloop recordings. Timing on the test server is slower and fixed and must not be used
+    # here; every timing number comes from live. Wheel turns happen between moves and add
+    # nothing.
     def self.seconds(legs)
       60 + 20 * rooms(legs)
     end
