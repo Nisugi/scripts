@@ -8,7 +8,8 @@
     ;osa-sail help
 
   Options (one trip):
-    --call-wind       cast Breeze (612) or Call Wind (912) into each sail and recast every 90 s
+    --call-wind       cast Breeze (612) or Call Wind (912) into each sail; Breeze is recast from its
+                      level-based duration ((3 * level / 9) * 9 s), Call Wind every 90 s
     --no-confirm      skip the plan confirmation
     --no-watch        do not send WATCH OCEAN
     --hull=<name>     name the hull when SHIP INFO cannot be read (sloop, brigantine, carrack, galleon, frigate, man o' war)
@@ -2827,6 +2828,8 @@ module OsaSail
     SAIL_STATE       = /sail (?:until it is (at half mast|fully open)|is (raised halfway|fully raised)|is already (lowered|raised) as far as it can go)[.!]/.freeze
     SAIL_FULL        = /until it is fully open|is already lowered as far as it can go/.freeze
     WIND_FILLED      = /ripples and billows with the sudden gust of wind/.freeze
+    SAIL_LOOK        = /currently raised|half mast|fully lowered|filled with magical wind/.freeze
+    SAIL_WINDED      = /filled with magical wind/.freeze
     ANCHOR_UP        = /as the anchor settles against the hull|The anchor is already up!/.freeze
     ANCHOR_PUSHING   = /begin to push|You manage to push|you shove/.freeze
     ANCHOR_DOWN      = /chain is unfurled and the anchor is deployed|anchor is already released|You must raise your anchor|releasing the anchor|strains against the deployed anchor|anchor can be heard rattling down the side/.freeze
@@ -2959,6 +2962,10 @@ module OsaSail
       Spell[num].known?
     end
 
+    def level
+      Stats.level
+    end
+
     def cast(num, target)
       Spell[num].cast(target)
     end
@@ -2998,7 +3005,15 @@ module OsaSail
 
   class Trip
     WIND_SPELLS = [612, 912].freeze
-    WIND_EVERY = 90
+    # Breeze (612) lasts (3 * level / 9) * 9 seconds, integer arithmetic: about 3 s a level,
+    # rounded down to a multiple of 9. Call Wind (912) is not measured yet; 90 s is the
+    # community scripts' recast interval. Recast one move early so the wind never lapses.
+    WIND_FALLBACK = 90
+    WIND_MARGIN = 20
+
+    def self.wind_duration(spell, level)
+      spell == 612 ? (3 * level.to_i / 9) * 9 : WIND_FALLBACK
+    end
     FIRST_MOVE_WAIT = 120
     MOVE_WAIT = 60
 
@@ -3183,8 +3198,11 @@ module OsaSail
         @call_wind = false
         return
       end
+      @wind_spell = spell
       Data::HULLS.fetch(@hull)[:masts].each do |mast_deck|
         go_to mast_deck
+        look = @game.send('look sail', Lines::SAIL_LOOK, timeout: 4)
+        next if look && Lines::SAIL_WINDED.match?(look)
         @game.cast(spell, 'sail')
       end
       @last_wind = Time.now
@@ -3323,7 +3341,9 @@ module OsaSail
     end
 
     def recast_wind
-      return unless @call_wind && @last_wind && Time.now - @last_wind > WIND_EVERY
+      return unless @call_wind && @last_wind
+      due = Trip.wind_duration(@wind_spell, @game.level) - WIND_MARGIN
+      return unless Time.now - @last_wind > due
       call_wind
       go_to 'Helm'
     end

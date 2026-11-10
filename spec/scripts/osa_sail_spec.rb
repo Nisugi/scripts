@@ -184,8 +184,13 @@ RSpec.describe OsaSail do
   class FakeGame
     attr_reader :commands, :walks, :logs, :position
 
-    def initialize(start_title:, swell_after: nil, ashore: false)
+    attr_reader :casts
+
+    def initialize(start_title:, swell_after: nil, ashore: false, wind: false)
       @title = start_title
+      @wind = wind
+      @casts = []
+      @winded = false
       @commands = []
       @walks = []
       @logs = []
@@ -203,8 +208,13 @@ RSpec.describe OsaSail do
 
     def title = @title
     def log(msg) = @logs << msg
-    def spell_known?(_) = false
-    def cast(_, _) = nil
+    def spell_known?(num) = @wind && num == 612
+    def level = 100
+
+    def cast(num, target)
+      @casts << [num, target]
+      @winded = true
+    end
     def watch(watcher) = @watcher = watcher
     def unwatch = @watcher = nil
     def confirm?(_) = true
@@ -267,6 +277,7 @@ RSpec.describe OsaSail do
       when 'ship flag' then 'The mistwood sloop is currently flying no flag.'
       when 'ship flag white' then 'Ashryn just raised a white flag atop the mistwood sloop.'
       when 'pull gangplank' then 'You grab the mistwood gangplank in both hands and pull it back up on the deck.'
+      when 'look sail' then @winded ? 'The canvas sail is fully lowered and filled with magical wind.' : 'The canvas sail is currently fully lowered.'
       when 'lower sail'
         @sail_pulls += 1
         @sail_pulls.odd? ? 'you slowly lower the canvas sail until it is at half mast.' : 'you slowly lower the canvas sail until it is fully open.'
@@ -361,6 +372,22 @@ RSpec.describe OsaSail do
       expect(game.walks[1..]).to include(*OsaSail::Data.piers_titled("North 'Haven Quay, Green Pier").first(1))
       expect(game.commands.count { |x| x.start_with?('ask #') }).to eq(2)
       expect(game.commands.index('go sloop')).to be < game.commands.index('ship flag')
+    end
+
+    it 'casts Breeze into each sail once, after looking, and times the recast by level' do
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', wind: true)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false, call_wind: true)
+      expect(trip.run).to eq(:arrived)
+
+      expect(game.casts).to eq([[612, 'sail']])
+      c = game.commands
+      expect(c.index('look sail')).to be < c.index('depart')
+      expect(c.rindex('lower sail')).to be < c.index('look sail')
+
+      expect(described_class.wind_duration(612, 100)).to eq(297)
+      expect(described_class.wind_duration(612, 50)).to eq(144)
+      expect(described_class.wind_duration(612, 2)).to eq(0)
+      expect(described_class.wind_duration(912, 100)).to eq(90)
     end
 
     it 'halts when the ship is already at the target port' do
