@@ -452,18 +452,18 @@ RSpec.describe OsaSail do
       expect(game.commands.grep(/^turn wheel/).size).to be <= described_class::STUCK_LIMIT + 1
     end
 
-    it 'waits out a short white-flag cooldown instead of sailing flagless' do
+    it 'waits out a short white-flag cooldown with --flag-wait' do
       game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', flag_cooldown: true)
-      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false, flag_wait: true)
       expect(trip.run).to eq(:arrived)
       expect(game.waits).to eq([365])
       expect(game.commands.count('ship flag white')).to eq(2)
       expect(game.commands.index('pull gangplank')).to be > game.commands.rindex('ship flag white')
     end
 
-    it 'sails at once on a cooldown with --no-flag-wait' do
+    it 'sails at once on a cooldown by default' do
       game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)', flag_cooldown: true)
-      trip = described_class.new(game, "Kraken's Fall", confirm: false, flag_wait: false)
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
       expect(trip.run).to eq(:arrived)
       expect(game.waits).to be_empty
       expect(game.commands.count('ship flag white')).to eq(1)

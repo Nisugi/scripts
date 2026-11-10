@@ -12,7 +12,7 @@
                       level-based duration ((3 * level / 9) * 9 s), Call Wind every 90 s
     --no-confirm      skip the plan confirmation
     --no-watch        do not send WATCH OCEAN
-    --no-flag-wait    sail at once if the white flag is on cooldown (default: wait up to 10 min for it)
+    --flag-wait       if the white flag is on cooldown, wait up to 10 min for it (default: sail at once and outrun trouble)
     --hull=<name>     name the hull when SHIP INFO cannot be read (sloop, brigantine, carrack, galleon, frigate, man o' war)
 
   The ship is left at the far pier. Nothing is stored.
@@ -3036,14 +3036,14 @@ module OsaSail
 
     attr_reader :hull, :deck, :position, :held
 
-    # Wait for the white flag's cooldown when it is at most this long. Sailing under no
-    # flag spawns enemy ships, and one of those cost a voyage in testing.
+    # With --flag-wait, wait for the white flag's cooldown when it is at most this long.
+    # Sailing under no flag can spawn enemy ships; the default is to go anyway and outrun them.
     FLAG_WAIT_MAX = 10 * 60
     # Headings that would not hold before trying another, and before giving up.
     STUCK_RETRIES = 3
     STUCK_LIMIT = 12
 
-    def initialize(game, target, call_wind: false, confirm: true, watch: true, hull: nil, flag_wait: true)
+    def initialize(game, target, call_wind: false, confirm: true, watch: true, hull: nil, flag_wait: false)
       @game = game
       @target = target
       @call_wind = call_wind
@@ -3522,20 +3522,20 @@ module OsaSail
         ;osa-sail <port>            retrieve or board your ship, sail to <port>, step onto the pier
         ;osa-sail route <port>      show the course only
         ;osa-sail ports             list the ports
-        options: --call-wind  --no-confirm  --no-watch  --no-flag-wait  --hull=<name>
+        options: --call-wind  --no-confirm  --no-watch  --flag-wait  --hull=<name>
         ports: #{Data::PORTS.keys.join(', ')}
       HELP
     end
 
     def self.main(args, game = Game.new)
       words = args.dup
-      opts = { call_wind: false, confirm: true, watch: true, hull: nil, flag_wait: true }
+      opts = { call_wind: false, confirm: true, watch: true, hull: nil, flag_wait: false }
       words.reject! do |w|
         case w
         when '--call-wind' then opts[:call_wind] = true
         when '--no-confirm' then opts[:confirm] = false
         when '--no-watch' then opts[:watch] = false
-        when '--no-flag-wait' then opts[:flag_wait] = false
+        when '--flag-wait' then opts[:flag_wait] = true
         when /^--hull=(.+)$/ then opts[:hull] = Deck.hull_by_name(Regexp.last_match(1))
         else next false
         end
