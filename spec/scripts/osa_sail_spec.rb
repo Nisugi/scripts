@@ -236,7 +236,7 @@ RSpec.describe OsaSail do
     ShipObj = Struct.new(:id, :noun, :name)
     OURS = ShipObj.new(45_157_737, 'sloop', 'shadowy black mistwood sloop')
     THEIRS = ShipObj.new(45_200_000, 'sloop', 'shadowy black mistwood sloop')
-    attr_writer :pier_objects
+    attr_writer :pier_objects, :plank_down
 
     def objects
       return [] unless @at_pier
@@ -302,8 +302,20 @@ RSpec.describe OsaSail do
           %(Kilvath says, "Looks like we have some space around the North 'Haven Quay, Green Pier."  The dock handler points to the northwest.)
         end
       when "go ##{OURS.id}"
-        @title = '[Sloop, Main Deck] (-7117010)'
-        'A shadowy black mistwood gangplank suddenly protrudes from the side of the sloop before slamming down.'
+        if @plank_down
+          'As you approach the mistwood sloop you realize there is already a shadowy black mistwood gangplank deployed!'
+        else
+          @title = '[Sloop, Main Deck] (-7117010)'
+          'A shadowy black mistwood gangplank suddenly protrudes from the side of the sloop before slamming down.'
+        end
+      when 'go gangplank'
+        if @plank_down && !@title.start_with?('[Sloop')
+          @title = '[Sloop, Main Deck] (-7117010)'
+          'You make your way across the mistwood gangplank.'
+        else
+          @title = "[Kraken's Fall, Fourth Pier] (7118240)"
+          'You make your way across the mistwood gangplank.'
+        end
       when "go ##{THEIRS.id}" then raise 'boarded somebody else\'s sloop'
       when "look ##{OURS.id}" then %(Sprawling across the back of the mistwood sloop it reads, "The Wild Maroon Tempest")
       when "look ##{THEIRS.id}" then %(Sprawling across the back of the mistwood sloop it reads, "The Other Fellow")
@@ -343,9 +355,6 @@ RSpec.describe OsaSail do
         @held = word == 'port' ? 'port' : OsaSail::Data::WORD_HEADING.fetch(word)
         "You grab hold of the wooden wheel and do your best to steer the ship to the #{word}."
       when 'push gangplank' then 'You give the mistwood gangplank a good shove, deploying it below.'
-      when 'go gangplank'
-        @title = "[Kraken's Fall, Fourth Pier] (7118240)"
-        'You make your way across the mistwood gangplank.'
       when 'west' then step('Helm')
       when 'east' then step('Main Deck')
       when 'up' then step("Crow's Nest")
@@ -474,6 +483,17 @@ RSpec.describe OsaSail do
       expect(described_class.wind_duration(612, 50)).to eq(144)
       expect(described_class.wind_duration(612, 2)).to eq(0)
       expect(described_class.wind_duration(912, 100)).to eq(90)
+    end
+
+    it 'boards by the gangplank when it is already down' do
+      game = FakeGame.new(start_title: "[North 'Haven Quay, Catwalk] (7124101)", ashore: true)
+      game.plank_down = true
+      trip = described_class.new(game, "Kraken's Fall", confirm: false)
+      expect(trip.run).to eq(:arrived)
+      c = game.commands
+      i = c.index("go ##{FakeGame::OURS.id}")
+      expect(c[i + 1]).to eq('go gangplank')
+      expect(c.count("go ##{FakeGame::OURS.id}")).to eq(1)
     end
 
     it 'tells our sloop from an identical one by its nameplate' do

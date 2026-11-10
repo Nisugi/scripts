@@ -3218,12 +3218,14 @@ module OsaSail
     # GO <ship> works whether the gangplank is out or not: the game deploys it on the way.
     # Recorded answers are "gangplank suddenly protrudes ... You make your way up" and
     # "you already deployed it! ... You make your way across".
+    # GO <ship> deploys the plank and boards when it is up. When it is already down the game
+    # only says so ("you realize there is already a slender gangplank deployed!") and the
+    # boarding is GO GANGPLANK.
     def board(ship)
-      4.times do
-        line = @game.send("go ##{ship.id}", Regexp.union(Lines::BOARDED, Lines::PLANK_DEPLOYS, Lines::CANT_GO), timeout: 6)
+      3.times do
+        @game.send("go ##{ship.id}", Regexp.union(Lines::BOARDED, Lines::PLANK_DEPLOYS, Lines::CANT_GO), timeout: 6)
         sleep 1
         break if Deck.parse_title(@game.title)
-        next unless line && Lines::CANT_GO.match?(line)
         @game.send('go gangplank', Regexp.union(Lines::BOARDED, Lines::CANT_GO), timeout: 6)
         sleep 1
         break if Deck.parse_title(@game.title)
