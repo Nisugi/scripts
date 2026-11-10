@@ -47,6 +47,9 @@ RSpec.describe OsaSail do
       expect(OsaSail::Data.port_of_pier(rooms.first)).to eq('Solhaven')
       expect(OsaSail::Data.port_looking('diverse')).to eq('Solhaven')
       expect(OsaSail::Data.port_looking('skerry-guarded')).to eq('Sleeping Drake Harbor')
+      expect(OsaSail::Data.port_looking('vine-tangled')).to eq("Sailor's Grief")
+      expect(OsaSail::Data.port_looking('salt-stained')).to eq('Glaoveln')
+      expect(OsaSail::Data::PORTS.values.map { |p| p[:looks] }).to all(be_a(String))
     end
   end
 
@@ -230,6 +233,8 @@ RSpec.describe OsaSail do
     def unwatch = @watcher = nil
     def confirm?(_) = true
     def current_uid = @standing_uid
+    def rooms_titled(_title) = @map_rooms || []
+    attr_writer :map_rooms
 
     def npcs
       @ashore && !@at_pier ? [Struct.new(:id, :noun, :name).new(482_307, 'handler', 'dock handler')] : []
@@ -506,6 +511,26 @@ RSpec.describe OsaSail do
       trip = described_class.new(game, "Kraken's Fall", confirm: false)
       expect { trip.run }.to raise_error(OsaSail::Halt, /could not walk to any room of North 'Haven Quay, Green Pier/)
       expect(game.walks.size).to eq(1 + game.unreachable.size)
+    end
+
+    it "falls back to the map for a pier the table lacks" do
+      game = FakeGame.new(start_title: "[Glaoveln, V'Koort Docks] (4426101)", ashore: true)
+      game.map_rooms = [4_426_101]
+      allow(game).to receive(:send).and_wrap_original do |m, command, *rest, **kw|
+        if command.start_with?('ask #')
+          game.commands << command
+          %(A dock handler says, "Looks like we have some space around the Glaoveln, V'Koort Docks."  The dock handler points.)
+        else
+          m.call(command, *rest, **kw)
+        end
+      end
+      allow(game).to receive(:walk_to).and_wrap_original do |m, uid|
+        game.instance_variable_set(:@at_pier, true) if uid == 4_426_101
+        m.call(uid)
+      end
+      trip = described_class.new(game, 'Solhaven', confirm: false)
+      expect(trip.run).to eq(:arrived)
+      expect(game.walks).to include(4_426_101)
     end
 
     it 'boards by the gangplank when it is already down' do

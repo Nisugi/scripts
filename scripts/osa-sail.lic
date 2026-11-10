@@ -2260,9 +2260,9 @@ module OsaSail
       "Icemule Trace" => { uid: 7116870, handler: 7133001, looks: "ramshackle" },
       "Brisker's Cove" => { uid: 7116594, handler: 7140501, looks: "sprawling imperial" },
       "Nielira Harbor" => { uid: 7137145, handler: 14150054, looks: "ivy-draped" },
-      "Glaoveln" => { uid: 7116863, handler: 4426101, looks: nil },
+      "Glaoveln" => { uid: 7116863, handler: 4426101, looks: "salt-stained" },
       "Sleeping Drake Harbor" => { uid: 7143512, handler: 7142201, looks: "skerry-guarded" },
-      "Sailor's Grief" => { uid: 7116648, handler: 7150106, looks: nil },
+      "Sailor's Grief" => { uid: 7116648, handler: 7150106, looks: "vine-tangled" },
     }.freeze
 
     # pier land uid => [port name, pier title]
@@ -2976,6 +2976,11 @@ module OsaSail
       Room.current&.uid&.first
     end
 
+    # Land room uids whose title is exactly "[title]", for a pier the pier table lacks.
+    def rooms_titled(title)
+      Map.list.select { |r| r && r.title.to_a.include?("[#{title}]") }.flat_map { |r| r.uid.to_a }.compact.sort
+    end
+
     def spell_known?(num)
       Spell[num].known?
     end
@@ -3162,7 +3167,8 @@ module OsaSail
 
       pier = ask_handler(departure)
       rooms = Data.piers_titled(pier)
-      raise Halt, "the handler named #{pier.inspect}, which is not in the pier table" if rooms.empty?
+      rooms = @game.rooms_titled(pier) if rooms.empty? # a pier the table lacks (Glaoveln's V'Koort Docks)
+      raise Halt, "the handler named #{pier.inspect}, which is neither in the pier table nor on the map" if rooms.empty?
 
       chosen = nil
       unreachable = []
