@@ -459,6 +459,15 @@ RSpec.describe OsaSail do
       expect(described_class.wind_duration(912, 100)).to eq(90)
     end
 
+    it "recognises a man o' war on the pier by name, since its noun is war" do
+      game = FakeGame.new(start_title: '[Sloop, Main Deck] (-7117010)')
+      trip = described_class.new(game, 'Solhaven', confirm: false, hull: "Man O' War")
+      obj = Struct.new(:noun, :name)
+      expect(trip.send(:ship_object?, obj.new('war', "a man o' war"))).to be(true)
+      expect(trip.send(:ship_object?, obj.new('man', 'a bustling man'))).to be(true)
+      expect(trip.send(:ship_object?, obj.new('sloop', 'shadowy black mistwood sloop'))).to be(false)
+    end
+
     it 'halts when another ship of yours is already out at a different port' do
       game = FakeGame.new(start_title: "[Kraken's Fall, Deadeye's Road] (7118238)", ashore: true)
       allow(game).to receive(:quiet).and_return(['Ships you own:', "MAN O' WAR    Docked at: Kraken's Fall", 'SLOOP    Docked at: Solhaven'])
