@@ -3184,7 +3184,7 @@ module OsaSail
           break if chosen
         end
         raise Halt, "could not walk to any room of #{pier} (map edges to #{unreachable.join(', ')} failed)" if unreachable.size == rooms.size
-        sleep 5 unless chosen
+        @game.wait(5) unless chosen
       end
       raise Halt, "could not find your #{ship_label} at #{pier}" unless chosen
 
@@ -3255,10 +3255,10 @@ module OsaSail
     def board(ship)
       3.times do
         @game.send("go ##{ship.id}", Regexp.union(Lines::BOARDED, Lines::PLANK_DEPLOYS, Lines::CANT_GO), timeout: 6)
-        sleep 1
+        @game.wait(1)
         break if Deck.parse_title(@game.title)
         @game.send('go gangplank', Regexp.union(Lines::BOARDED, Lines::CANT_GO), timeout: 6)
-        sleep 1
+        @game.wait(1)
         break if Deck.parse_title(@game.title)
       end
       parsed = Deck.parse_title(@game.title)
@@ -3518,7 +3518,7 @@ module OsaSail
       @game.send('push gangplank', Regexp.union(Lines::PLANK_DOWN, /gangplank/), timeout: 5)
       line = @game.send('go gangplank', Regexp.union(Lines::BOARDED, Lines::CANT_GO), timeout: 8)
       raise Halt, 'could not get ashore' unless line && Lines::BOARDED.match?(line)
-      sleep 1
+      @game.wait(1)
       @game.log "ashore at #{@game.title}"
     end
 
